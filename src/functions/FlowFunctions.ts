@@ -81,12 +81,12 @@ export const getAndSaveActiveAlerts = async () => {
           deviceType: alertValidate.deviceType,
           type: alertValidate.type,
           title: alertValidate.title,
-          description: alertValidate.description || "Sin Descripcion",
+          description: alertValidate.description || "",
           severity: alertValidate.severity,
           scope: alertValidate.scope,
           descriptionGlpi: alertValidate.descriptionGlpi,
           isGlpi: alertValidate.isGlpi,
-          comment: alertValidate.comment || "Sin Comentario",
+          comment: alertValidate.comment || "",
         };
         await saveAlert(alertToSave);
       }
@@ -122,7 +122,7 @@ const validateDeviceNameInGlpi = async (
       return {
         descriptionGlpi: DescriptionEnum.NO_MATCH_DEVICE_NAME,
         isGlpi: false,
-        comment: DescriptionEnum.NO_MATCH_DEVICE_NAME,
+        comment: "",
       };
     }
   } catch (error) {
@@ -138,9 +138,10 @@ export const validateAndBuildAlertsToSend = async () => {
   try {
     const alerts: IAlert[] = await getAlertsInGlpi();
     const alertsToSend: IAlertHelix[] = await validateAlarmManual(alerts);
-    const emitAlertsToHelix = await sendAlertsToTcp(alertsToSend);
+    const emitAlertsToHelix: { success: number; failed: number } =
+      await sendAlertsToTcp(alertsToSend);
     console.log(
-      `Alertas emitidas al servidor TCP => ${emitAlertsToHelix.length}`
+      `${emitAlertsToHelix.success} alertas emitidas satisfactorias y ${emitAlertsToHelix.failed} fallidas al servidor TCP`
     );
   } catch (error) {
     console.log(error);

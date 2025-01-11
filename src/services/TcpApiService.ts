@@ -9,11 +9,12 @@ export const sendAlertsToTcp = async (
   const urlServerTcp = process.env.URL_TCP_SERVER;
 
   try {
-    const response = await axios.post(`${urlServerTcp}/api/alerts`, {
-      body: { alertsToHelix },
-    });
+    const response = await axios.post(
+      `${urlServerTcp}/api/alerts`,
+      alertsToHelix
+    );
     return response.data;
-  } catch {
+  } catch (error) {
     throw handleError(ErrorCode.E010);
   }
 };

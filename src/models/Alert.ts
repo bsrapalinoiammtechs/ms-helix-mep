@@ -72,7 +72,7 @@ const alertSchema = new Schema<IAlert>(
     description: { type: String, required: false },
     severity: { type: String, required: true },
     scope: { type: scopeSchema, required: true },
-    comment: { type: String, required: true },
+    comment: { type: String, required: false },
     descriptionGlpi: { type: String, required: false },
     isGlpi: { type: Boolean, required: true },
   },
