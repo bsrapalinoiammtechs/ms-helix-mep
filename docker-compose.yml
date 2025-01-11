@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  mongodb-helix:
+    image: mongo:latest
+    container_name: mongodb-helix
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: andrair
+      MONGO_INITDB_ROOT_PASSWORD: 1234
+    ports:
+      - "27017:27017" # Para acceder a MongoDB desde tu máquina local
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - ms-helix-network
+
+  ms-helix:
+    # image: andrair/ms-helix
+    build: 
+      context: ./
+    container_name: ms-helix
+    env_file:
+      - .env
+    ports:
+      - "3001:3001" # Expone el puerto de tu microservicio
+    depends_on:
+      - mongodb-helix # Garantiza que MongoDB se inicie antes que tu app
+    networks:
+      - ms-helix-network
+
+networks:
+  ms-helix-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:

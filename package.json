@@ -1,0 +1,31 @@
+{
+  "name": "ms-helix",
+  "version": "1.0.0",
+  "main": "build/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "start:prod": "npm run build && npm start"
+  },
+  "keywords": [],
+  "author": "Andres Rairan",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@types/express": "5.0.0",
+    "@types/lodash": "4.17.13",
+    "@types/node": "22.9.0",
+    "@types/node-cron": "3.0.11",
+    "typescript": "5.6.2"
+  },
+  "dependencies": {
+    "axios": "1.7.7",
+    "date-fns": "4.1.0",
+    "date-fns-tz": "3.2.0",
+    "dotenv": "16.4.5",
+    "express": "4.21.2",
+    "lodash": "4.17.21",
+    "mongoose": "8.8.4",
+    "node-cron": "3.0.3"
+  }
+}
