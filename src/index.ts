@@ -15,7 +15,7 @@ cron.schedule("* * * * *", () => {
   getAndSaveActiveAlerts();
 });
 
-cron.schedule("*/2 * * * *", () => {
+cron.schedule("* * * * *", () => {
   validateAndBuildAlertsToSend();
 });
 
