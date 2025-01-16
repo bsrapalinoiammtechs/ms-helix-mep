@@ -87,6 +87,7 @@ export const getAndSaveActiveAlerts = async () => {
           descriptionGlpi: alertValidate.descriptionGlpi,
           isGlpi: alertValidate.isGlpi,
           comment: alertValidate.comment || "",
+          isTcp: false,
         };
         await saveAlert(alertToSave);
       }

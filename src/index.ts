@@ -11,15 +11,15 @@ import {
 
 connectDB();
 
-cron.schedule("* * * * *", () => {
+cron.schedule("*/30 * * * * *", () => {
   getAndSaveActiveAlerts();
 });
 
-cron.schedule("* * * * *", () => {
+cron.schedule("*/30 * * * * *", () => {
   validateAndBuildAlertsToSend();
 });
 
-cron.schedule("* * * * *", () => {
+cron.schedule("*/30 * * * * *", () => {
   getAndSetResolvedAlerts();
 });
 

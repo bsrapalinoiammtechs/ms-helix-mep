@@ -40,7 +40,7 @@ export const updateAlertResolved = async (
   try {
     const updatedAlert = await Alert.findOneAndUpdate(
       { alertId },
-      { resolvedAt: resolvedAt },
+      { resolvedAt: resolvedAt, startedAt: resolvedAt },
       { new: true }
     );
 
