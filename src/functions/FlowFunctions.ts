@@ -8,6 +8,7 @@ import {
   getAlarmsManual,
   getAlertsInGlpi,
   saveAlert,
+  setIsTCpAlert,
   updateAlertResolved,
 } from "../services/MongoDBService";
 import { format } from "date-fns";
@@ -24,8 +25,8 @@ import { FieldEnum } from "../enums/FieldEnum";
 import { AlertSeverityHelixEnum } from "../enums/AlertSeverityEnum";
 import { handleError } from "../handlers/ErrorHandler";
 import { ErrorCode } from "../enums/ErrorEnum";
-import lodash from "lodash";
 import { sendAlertsToTcp } from "../services/TcpApiService";
+import lodash from "lodash";
 
 export const getAndSaveActiveAlerts = async () => {
   const organizationId: string = process.env.ORGANIZATION_ID || "";
@@ -141,6 +142,22 @@ export const validateAndBuildAlertsToSend = async () => {
     const alertsToSend: IAlertHelix[] = await validateAlarmManual(alerts);
     const emitAlertsToHelix: { success: number; failed: number } =
       await sendAlertsToTcp(alertsToSend);
+
+    const setIsTcp = alertsToSend.map(
+      async (alertIsTcp: { alertId: string }) => {
+        try {
+          await setIsTCpAlert(alertIsTcp.alertId);
+        } catch (error) {
+          console.error(
+            `Error al setear isTcp en la alerta ${alertIsTcp.alertId}`,
+            error
+          );
+        }
+      }
+    );
+
+    await Promise.allSettled(setIsTcp);
+
     console.log(
       `${emitAlertsToHelix.success} alertas emitidas satisfactorias y ${emitAlertsToHelix.failed} fallidas al servidor TCP`
     );

@@ -45,7 +45,7 @@ export const updateAlertResolved = async (
     );
 
     if (!updatedAlert) {
-      throw new Error(`Aerta con ID ${alertId} no encontrado`);
+      throw new Error(`Alerta con ID ${alertId} no encontrado`);
     }
 
     return updatedAlert;
@@ -80,11 +80,29 @@ export const updateCeseAlert = async (alertId: string) => {
     );
 
     if (!updatedAlert) {
-      throw new Error(`Aerta con ID ${alertId} no encontrado`);
+      throw new Error(`Alerta con ID ${alertId} no encontrado`);
     }
 
     return updatedAlert;
   } catch (error) {
     throw handleError(ErrorCode.E009, alertId);
+  }
+};
+
+export const setIsTCpAlert = async (alertId: string) => {
+  try {
+    const updatedAlert = await Alert.findOneAndUpdate(
+      { alertId },
+      { isTcp: true },
+      { new: true }
+    );
+
+    if (!updatedAlert) {
+      throw new Error(`Alerta con ID ${alertId} no encontrado`);
+    }
+
+    return updatedAlert;
+  } catch (error) {
+    throw handleError(ErrorCode.E013, alertId);
   }
 };

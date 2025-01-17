@@ -13,6 +13,7 @@ export enum ErrorCode {
   E010 = "E010",
   E011 = "E011",
   E012 = "E012",
+  E013 = "E013",
   E088 = "EO88",
 }
 
@@ -82,6 +83,11 @@ export const ERRORS: Record<ErrorCode, AppError<ErrorCode>> = {
   [ErrorCode.E012]: {
     code: ErrorCode.E012,
     message: "Hubo un error y no fue posible obtener el manual de alarmas",
+    statusCode: StatusCodeEnum.BadRequest,
+  },
+  [ErrorCode.E013]: {
+    code: ErrorCode.E013,
+    message: "Error al actualizar isTcp en una alerta.",
     statusCode: StatusCodeEnum.BadRequest,
   },
   [ErrorCode.E088]: {
