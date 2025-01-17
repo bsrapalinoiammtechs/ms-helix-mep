@@ -40,7 +40,7 @@ export const updateAlertResolved = async (
   try {
     const updatedAlert = await Alert.findOneAndUpdate(
       { alertId },
-      { resolvedAt: resolvedAt, startedAt: resolvedAt },
+      { resolvedAt: resolvedAt },
       { new: true }
     );
 
@@ -68,24 +68,6 @@ export const getAlarmsManual = async (
     return alarmsManual;
   } catch (error) {
     throw handleError(ErrorCode.E012);
-  }
-};
-
-export const updateCeseAlert = async (alertId: string) => {
-  try {
-    const updatedAlert = await Alert.findOneAndUpdate(
-      { alertId },
-      { isGlpi: false },
-      { new: true }
-    );
-
-    if (!updatedAlert) {
-      throw new Error(`Alerta con ID ${alertId} no encontrado`);
-    }
-
-    return updatedAlert;
-  } catch (error) {
-    throw handleError(ErrorCode.E009, alertId);
   }
 };
 

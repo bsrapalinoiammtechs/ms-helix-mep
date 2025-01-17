@@ -183,7 +183,9 @@ async function validateAlarmManual(alerts: IAlert[]) {
         alertsToSend.push({
           tipo: tipo,
           idNotificacion: alert.scope.devices[0].url,
-          fechaHora: formatDateString(alert.startedAt),
+          fechaHora: !lodash.isNull(alert.resolvedAt)
+            ? formatDateString(alert.resolvedAt)
+            : formatDateString(alert.startedAt),
           nombreEquipo: alert.scope.devices[0].name,
           ipEquipo: alert.scope.devices[0].mac,
           causaEvento: alarmManual[0].categoryType,
