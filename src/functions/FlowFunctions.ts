@@ -38,6 +38,7 @@ export const getAndSaveActiveAlerts = async () => {
       descriptionGlpi: string;
       isGlpi: boolean;
       comment: string;
+      location: string;
     };
     let validateAlerts: IAlertCiscoGlpi[] = [];
 
@@ -47,6 +48,7 @@ export const getAndSaveActiveAlerts = async () => {
           descriptionGlpi: string;
           isGlpi: boolean;
           comment: string;
+          location: string;
         } = await validateDeviceNameInGlpi(
           lodash.defaultTo(alertCisco.scope.devices[0].name, "")
         );
@@ -56,6 +58,7 @@ export const getAndSaveActiveAlerts = async () => {
             descriptionGlpi: validationGlpi.descriptionGlpi,
             isGlpi: validationGlpi.isGlpi,
             comment: validationGlpi.comment,
+            location: validationGlpi.location,
           });
         }
       } catch (error) {
@@ -89,6 +92,7 @@ export const getAndSaveActiveAlerts = async () => {
           isGlpi: alertValidate.isGlpi,
           comment: alertValidate.comment || "",
           isTcp: false,
+          location: alertValidate.location,
         };
         await saveAlert(alertToSave);
       }
@@ -103,7 +107,12 @@ export const getAndSaveActiveAlerts = async () => {
 
 const validateDeviceNameInGlpi = async (
   nameDevice: string
-): Promise<{ descriptionGlpi: string; isGlpi: boolean; comment: string }> => {
+): Promise<{
+  descriptionGlpi: string;
+  isGlpi: boolean;
+  comment: string;
+  location: string;
+}> => {
   try {
     const sessionToken: string = await getSessionToken();
     const networkId: { match: boolean; id: string } = await getNetworkId(
@@ -119,12 +128,14 @@ const validateDeviceNameInGlpi = async (
         descriptionGlpi: networkData.sysdescr,
         isGlpi: true,
         comment: networkData.comment,
+        location: networkData.locations_id,
       };
     } else {
       return {
         descriptionGlpi: DescriptionEnum.NO_MATCH_DEVICE_NAME,
         isGlpi: false,
         comment: "",
+        location: "",
       };
     }
   } catch (error) {
@@ -132,6 +143,7 @@ const validateDeviceNameInGlpi = async (
       descriptionGlpi: DescriptionEnum.NO_MATCH_DEVICE_NAME,
       isGlpi: false,
       comment: DescriptionEnum.NO_MATCH_DEVICE_NAME,
+      location: DescriptionEnum.NO_MATCH_DEVICE_NAME,
     };
   }
 };
@@ -195,7 +207,7 @@ async function validateAlarmManual(alerts: IAlert[]) {
             : alarmManual[0].severityHelix,
           descripcionEvento: `${alarmManual[0].elementType} - ${alarmManual[0].categoryType} - ${alert.comment}`,
           nombreCliente: alert.organization.name,
-          ubicacion: alert.network.name,
+          ubicacion: alert.location,
           fase: fase,
           alertId: alert.alertId,
           organization: alert.organization,

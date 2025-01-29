@@ -19,6 +19,7 @@ interface IAlert extends Document {
   descriptionGlpi: string;
   isGlpi: boolean;
   isTcp: boolean;
+  location: string;
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -77,6 +78,7 @@ const alertSchema = new Schema<IAlert>(
     descriptionGlpi: { type: String, required: false },
     isGlpi: { type: Boolean, required: true },
     isTcp: { type: Boolean, required: true, default: false },
+    location: { type: String, required: false },
   },
   { timestamps: true } // Habilita `createdAt` y `updatedAt`
 );

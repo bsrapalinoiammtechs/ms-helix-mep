@@ -16,6 +16,7 @@ export interface IAlert {
   descriptionGlpi: string;
   isGlpi: boolean;
   isTcp: boolean;
+  location: string;
   createdAt?: Date;
   updatedAt?: Date;
 }

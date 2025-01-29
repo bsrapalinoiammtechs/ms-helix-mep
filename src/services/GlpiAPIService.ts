@@ -89,6 +89,9 @@ export const getNetworkData = async (
           "App-Token": appToken,
           "Content-Type": "application/json",
         },
+        params: {
+          expand_dropdowns: true,
+        },
       }
     );
     const responseData: INetworkGlpi = response.data;
