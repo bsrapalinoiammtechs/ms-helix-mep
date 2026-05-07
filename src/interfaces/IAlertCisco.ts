@@ -11,7 +11,7 @@ export interface IAlertCisco {
   title: string;
   description: string | null;
   severity: string;
-  cursor: number;
+  cursor: string; //number
   scope: IScopeCisco;
   schemaVersion: string;
 }

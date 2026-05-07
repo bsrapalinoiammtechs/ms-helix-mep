@@ -1,0 +1,97 @@
+Reiniciando ms-helix-mep3...
+time="2026-05-07T08:00:01Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+ Container ms-helix-mep  Stopping
+ Container ms-helix-mep  Stopped
+ Container ms-helix-mep  Removing
+ Container ms-helix-mep  Removed
+ Container mongodb-helix-mep  Stopping
+ Container mongodb-helix-mep  Stopped
+ Container mongodb-helix-mep  Removing
+ Container mongodb-helix-mep  Removed
+ Network ms-helix-mep3_ms-helix-network  Removing
+ Network ms-helix-mep3_ms-helix-network  Removed
+time="2026-05-07T08:00:13Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+#0 building with "default" instance using docker driver
+
+#1 [ms-helix-mep internal] load build definition from Dockerfile
+#1 transferring dockerfile: 216B done
+#1 DONE 0.0s
+
+#2 [ms-helix-mep internal] load metadata for docker.io/library/node:20-alpine
+#2 DONE 0.9s
+
+#3 [ms-helix-mep internal] load .dockerignore
+#3 transferring context: 78B done
+#3 DONE 0.0s
+
+#4 [ms-helix-mep 1/6] FROM docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
+#4 DONE 0.0s
+
+#5 [ms-helix-mep internal] load build context
+#5 transferring context: 10.56kB 0.0s done
+#5 DONE 0.0s
+
+#6 [ms-helix-mep 2/6] WORKDIR /app
+#6 CACHED
+
+#7 [ms-helix-mep 3/6] COPY package*.json tsconfig.json .env ./
+#7 CACHED
+
+#8 [ms-helix-mep 4/6] RUN npm install
+#8 CACHED
+
+#9 [ms-helix-mep 5/6] COPY . .
+#9 DONE 0.1s
+
+#10 [ms-helix-mep 6/6] RUN npm run build
+#10 0.838 
+#10 0.838 > ms-helix@1.0.0 build
+#10 0.838 > tsc
+#10 0.838 
+#10 3.708 npm notice
+#10 3.708 npm notice New major version of npm available! 10.8.2 -> 11.14.0
+#10 3.708 npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.14.0
+#10 3.708 npm notice To update run: npm install -g npm@11.14.0
+#10 3.708 npm notice
+#10 DONE 3.7s
+
+#11 [ms-helix-mep] exporting to image
+#11 exporting layers 0.0s done
+#11 writing image sha256:f2f0a52af7d80b0a7db92009b3bcdc804e7ff519e0fff736d35253eae7dd8f45 done
+#11 naming to docker.io/library/ms-helix-mep3-ms-helix-mep done
+#11 DONE 0.1s
+
+#12 [ms-helix-mep] resolving provenance for metadata file
+#12 DONE 0.0s
+ Network ms-helix-mep3_ms-helix-network  Creating
+ Network ms-helix-mep3_ms-helix-network  Created
+ Container mongodb-helix-mep  Creating
+ Container mongodb-helix-mep  Created
+ Container ms-helix-mep  Creating
+ Container ms-helix-mep  Created
+ Container mongodb-helix-mep  Starting
+ Container mongodb-helix-mep  Started
+ Container ms-helix-mep  Starting
+ Container ms-helix-mep  Started
+Reiniciando ms-helix-tcp...
+ Container ms-helix-tcp  Stopping
+ Container ms-helix-tcp  Stopped
+ Container ms-helix-tcp  Removing
+ Container ms-helix-tcp  Removed
+ Container mongodb-tcp  Stopping
+ Container mongodb-tcp  Stopped
+ Container mongodb-tcp  Removing
+ Container mongodb-tcp  Removed
+ Network ms-helix-tcp_ms-helix-network  Removing
+ Network ms-helix-tcp_ms-helix-network  Removed
+ Network ms-helix-tcp_ms-helix-network  Creating
+ Network ms-helix-tcp_ms-helix-network  Created
+ Container mongodb-tcp  Creating
+ Container mongodb-tcp  Created
+ Container ms-helix-tcp  Creating
+ Container ms-helix-tcp  Created
+ Container mongodb-tcp  Starting
+ Container mongodb-tcp  Started
+ Container ms-helix-tcp  Starting
+ Container ms-helix-tcp  Started
+¡Ambos servicios han sido reiniciados exitosamente!

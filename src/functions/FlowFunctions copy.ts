@@ -23,8 +23,8 @@ import { DescriptionEnum } from "../enums/DescriptionEnum";
 import { IAlertHelix } from "../interfaces/IAlertHelix";
 import { FieldEnum } from "../enums/FieldEnum";
 import { AlertSeverityHelixEnum } from "../enums/AlertSeverityEnum";
-// import { handleError } from "../handlers/ErrorHandler";
-// import { ErrorCode } from "../enums/ErrorEnum";
+import { handleError } from "../handlers/ErrorHandler";
+import { ErrorCode } from "../enums/ErrorEnum";
 import { sendAlertsToTcp } from "../services/TcpApiService";
 import lodash from "lodash";
 
@@ -32,9 +32,8 @@ export const getAndSaveActiveAlerts = async () => {
   const organizationId: string = process.env.ORGANIZATION_ID || "";
   const organizationName: string = process.env.ORGANIZATION_NAME || "";
   try {
-    console.log("SAA: Obteniendo alertas activas para procesar su guardado: ", new Date(Date.now()).toLocaleString('es-CO'));
     const ciscoAlerts: IAlertCisco[] = await getListOfActiveAlerts();
-    console.log("SAA: Cantidad de alertas cisco para procesar: ", ciscoAlerts?.length);
+
     type IAlertCiscoGlpi = IAlertCisco & {
       descriptionGlpi: string;
       isGlpi: boolean;
@@ -44,15 +43,13 @@ export const getAndSaveActiveAlerts = async () => {
     let validateAlerts: IAlertCiscoGlpi[] = [];
 
     for (const alertCisco of ciscoAlerts) {
+      // 🔧 Normaliza ANTES del try para que esté en scope también en el catch
+      const rawName = lodash.defaultTo(alertCisco.scope?.devices?.[0]?.name, "");
+      const normName = rawName.replace(/\s+/g, " ").trim();
+        
       try {
-        const validationGlpi: {
-          descriptionGlpi: string;
-          isGlpi: boolean;
-          comment: string;
-          location: string;
-        } = await validateDeviceNameInGlpi(
-          lodash.defaultTo(alertCisco.scope.devices[0].name, "")
-        );
+        const validationGlpi = await validateDeviceNameInGlpi(normName);
+      
         if (validationGlpi.isGlpi) {
           validateAlerts.push({
             ...alertCisco,
@@ -64,12 +61,12 @@ export const getAndSaveActiveAlerts = async () => {
         }
       } catch (error) {
         console.warn(
-          `No se pudo validar el dispositivo: ${alertCisco.scope.devices[0].name}`,
+          `No se pudo validar el dispositivo (raw="${rawName}", norm="${normName}")`,
           error
         );
       }
     }
-
+    
     const savePromises = validateAlerts.map(
       async (alertValidate: IAlertCiscoGlpi) => {
         const alertToSave: IAlert = {
@@ -100,7 +97,7 @@ export const getAndSaveActiveAlerts = async () => {
     );
 
     await Promise.all(savePromises);
-    console.log(`SAA: ${validateAlerts.length} alertas de cisco validas procesadas`);
+    console.log(`${validateAlerts.length} alertas de cisco validas procesadas`);
   } catch (error) {
     console.log(error);
   }
@@ -152,16 +149,10 @@ const validateDeviceNameInGlpi = async (
 export const validateAndBuildAlertsToSend = async () => {
   try {
     const alerts: IAlert[] = await getAlertsInGlpi();
-    const alertsFiltered: IAlert[] = alerts.filter((a) => a.isTcp === false);
-    console.log("Cantidad de alertas en GLPI para validar y enviar: ", alertsFiltered?.length, new Date(Date.now()).toLocaleString('es-CO'));
-
-    const alertsToSend: IAlertHelix[] = await validateAlarmManual(alertsFiltered);
-    console.log("Alertas a enviar: ", alertsToSend.length, new Date(Date.now()).toLocaleString('es-CO'));
-
+    const alertsToSend: IAlertHelix[] = await validateAlarmManual(alerts);
     const emitAlertsToHelix: { success: number; failed: number } =
       await sendAlertsToTcp(alertsToSend);
-    console.log(`Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
-    
+
     const setIsTcp = alertsToSend.map(
       async (alertIsTcp: { alertId: string }) => {
         try {
@@ -190,19 +181,18 @@ async function validateAlarmManual(alerts: IAlert[]) {
   const fase: string = process.env.FASE_ALERTA || FieldEnum.FASE;
 
   let alertsToSend: IAlertHelix[] = [];
-  let alertNotSentCount = 0;
+
   for (const alert of alerts) {
     try {
       const alarmManual = await getAlarmsManual(
         alert.type,
         alert.scope.devices[0].productType
       );
-      // console.log("validateAlarmManual name:", alert.scope.devices[0].name, " - ",alert.alertId, "- productType: ", alert.scope.devices[0].productType, " type:", alert.type, " alarmManual:", alarmManual[0]?.productType, " CESE? ", !lodash.isNull(alert.resolvedAt))
 
       if (alarmManual.length > 0) {
         alertsToSend.push({
           tipo: tipo,
-          idNotificacion: alert.alertId,
+          idNotificacion: alert.scope.devices[0].url,
           fechaHora: !lodash.isNull(alert.resolvedAt)
             ? formatDateString(alert.resolvedAt)
             : formatDateString(alert.startedAt),
@@ -222,15 +212,9 @@ async function validateAlarmManual(alerts: IAlert[]) {
         });
       }
     } catch (error) {
-      alertNotSentCount = alertNotSentCount +1;
-      console.error(
-        `Error al validar la alerta ${alert.alertId} para envío manual, no se enviará a Helix`,
-        error
-      );
-      // throw handleError(ErrorCode.E012, alert.alertId);
+      throw handleError(ErrorCode.E012, alert.alertId);
     }
   }
-  console.log(`Total alertas a enviar: ${alertsToSend.length}. Alertas no enviadas por error: ${alertNotSentCount}, `, new Date(Date.now()).toLocaleString('es-CO'));
   return alertsToSend;
 }
 
@@ -243,10 +227,9 @@ function formatDateString(dateString: string): string {
 
 export const getAndSetResolvedAlerts = async () => {
   try {
-    console.log("SRA: Obteniendo alertas resueltas para procesar su actualización: ", new Date(Date.now()).toLocaleString('es-CO'));
     const resolvedAlerts: IAlertCisco[] = await getListOfResolvedAlerts();
     const activeAlerts: IAlert[] = await getAlertsInGlpi();
-    console.log("resolvedAlerts[0]: ", resolvedAlerts[0])
+
     const activeAlertsMap = new Map(
       activeAlerts.map((alert) => [alert.alertId, alert])
     );
@@ -266,7 +249,6 @@ export const getAndSetResolvedAlerts = async () => {
     const updatedPromises = alertsToUpdate.map(
       async (alertToUpdate: { alertId: string; resolvedAt: string }) => {
         try {
-          console.log("updatedPromises: ", alertToUpdate.alertId);
           await updateAlertResolved(
             alertToUpdate.alertId,
             alertToUpdate.resolvedAt
@@ -280,9 +262,8 @@ export const getAndSetResolvedAlerts = async () => {
       }
     );
 
-
     await Promise.allSettled(updatedPromises);
-    console.log(`SRA: Se resolvieron: ${alertsToUpdate.length} alertas`);
+    console.log(`Se resolvieron: ${alertsToUpdate.length} alertas`);
   } catch (error) {
     console.log(error);
   }

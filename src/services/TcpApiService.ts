@@ -11,10 +11,19 @@ export const sendAlertsToTcp = async (
   try {
     const response = await axios.post(
       `${urlServerTcp}/api/alerts`,
-      alertsToHelix
+      alertsToHelix,
+      {
+      headers: {
+        'Content-Type': 'application/json',
+        'MS-Header': 'mep'
+      }
+    }
     );
+    // console.log("resumen envio a tcp: ", alertsToHelix.map((a) => `${a.alertId}`))
+    console.log(`TCP API: Enviando ${JSON.stringify(alertsToHelix.length)} alertas a TCP Server: `, new Date(Date.now()).toLocaleString('es-CO'));
     return response.data;
   } catch (error) {
+    console.error(`TCP API: Error al enviar alertas a TCP Server: `, error);
     throw handleError(ErrorCode.E010);
   }
 };

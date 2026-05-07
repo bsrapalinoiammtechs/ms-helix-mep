@@ -1,30 +1,34 @@
+version: "2.4"
 services:
   mongodb-helix-mep:
     image: mongo:latest
+    restart: always
     container_name: mongodb-helix-mep
     environment:
       MONGO_INITDB_ROOT_USERNAME: andrair
       MONGO_INITDB_ROOT_PASSWORD: 1234
     ports:
-      - "27019:27017"
+      - "27023:27017" # Para acceder a MongoDB desde tu máquina local
     volumes:
       - mongodb_data_mep:/data/db
     networks:
       - ms-helix-network
 
   ms-helix-mep:
-    # image: andrair/ms-helix-mep
-    build: 
+    build:
       context: ./
     container_name: ms-helix-mep
+    #mem_limit: 12g
+    restart: always
     env_file:
       - .env
     ports:
-      - "3001:3001" 
+      - "3005:3005"
     depends_on:
-      - mongodb-helix-mep 
+      - mongodb-helix-mep
     networks:
       - ms-helix-network
+    command: node --max-old-space-size=10240 build/index.js
 
 networks:
   ms-helix-network:

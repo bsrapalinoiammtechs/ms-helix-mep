@@ -40,7 +40,7 @@ export const getNetworkId = async (
 ): Promise<{ match: boolean; id: string }> => {
   const url = process.env.URL_GLPI;
   const appToken = process.env.APP_TOKEN_GLPI;
-  let responseGetNetworkId = { match: false, id: "" };
+  
 
   try {
     const response = await axios.get(`http://${url}/search/NetworkEquipment`, {
@@ -58,16 +58,30 @@ export const getNetworkId = async (
     });
     const responseData: IResponseSearchNetworkId = response.data;
 
-    if (responseData.totalcount > 0) {
-      if (lodash.get(responseData.data[0], "1", "") === nameDevice) {
-        responseGetNetworkId = {
-          match: true,
-          id: responseData.data[0]["2"].toString(),
-        };
-      }
+    const needle = (nameDevice ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+
+    // Mapea filas relevantes del search
+    const rows = responseData.data.map(r => ({
+      name: lodash.get(r, "1", ""),
+      id: String(r["2"]),
+    }));
+
+    // Match exacto pero normalizado (espacios y case-insensitive)
+    const exact = rows.find(r =>
+      r.name.replace(/\s+/g, " ").trim().toLowerCase() === needle
+    );
+
+    if (exact) {
+      return { match: true, id: exact.id };
     }
 
-    return responseGetNetworkId;
+    // Fallback: si GLPI devuelve solo 1 resultado, acéptalo
+    if (responseData.totalcount === 1 && rows.length === 1) {
+      return { match: true, id: rows[0].id };
+    }
+
+    return { match: false, id: "" };
+
   } catch (error) {
     throw handleError(ErrorCode.E007);
   }

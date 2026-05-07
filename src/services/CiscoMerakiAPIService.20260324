@@ -1,0 +1,86 @@
+import axios from "axios";
+//import axios, { AxiosError } from "axios";
+import { handleError } from "../handlers/ErrorHandler";
+import { ErrorCode } from "../enums/ErrorEnum";
+import { IAlertCisco } from "../interfaces/IAlertCisco";
+
+const ORG_ID = process.env.ORGANIZATION_ID!;
+const TOKEN  = process.env.TOKEN_CISCO!;
+
+
+  //páginas usando la cabecera 'Link: rel="next"'
+
+async function fetchAllAlerts(params: Record<string, any>): Promise<IAlertCisco[]> {
+  let url: string | null = `https://api.meraki.com/api/v1/organizations/${ORG_ID}/assurance/alerts`;
+  let queryParams = { ...params };
+  const allAlerts: IAlertCisco[] = [];
+
+  while (url) {
+    const response = await axios.get<IAlertCisco[]>(
+      url,
+      {
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        params: queryParams,
+        validateStatus: () => true,
+      }
+    );
+
+    if (response.status >= 400) {
+      throw handleError(ErrorCode.E001);
+    }
+
+    // Acumula datos de pg
+    allAlerts.push(...response.data);
+
+    // next de la cabecera Link
+    const linkHeader = response.headers["link"] as string | undefined;
+    url = null;
+    if (linkHeader) {
+      const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+      if (match) {
+        url = match[1];
+       
+        queryParams = {};
+      }
+    }
+  }
+
+  return allAlerts;
+}
+
+
+ // TOODAS las alertas activas 
+
+export const getListOfActiveAlerts = async (): Promise<IAlertCisco[]> => {
+  try {
+    return await fetchAllAlerts({
+      active: true,
+      resolved: false,
+      //suppressAlertsForOfflineNodes: true, //POSIBLE PARA QUE NO HAYAN RETENIDAS...
+      perPage: 300,
+      sortOrder: "descending",
+    });
+  } catch {
+    throw handleError(ErrorCode.E001);
+  }
+};
+
+
+  //TOODAS las alertas resueltas 
+
+export const getListOfResolvedAlerts = async (): Promise<IAlertCisco[]> => {
+  try {
+    return await fetchAllAlerts({
+      resolved: true,
+      active: false,
+      suppressAlertsForOfflineNodes: true, //POSIBLE PARA QUE NO HAYAN RETENIDAS...
+      perPage: 300,
+      sortOrder: "descending",
+    });
+  } catch {
+    throw handleError(ErrorCode.E005);
+  }
+};
