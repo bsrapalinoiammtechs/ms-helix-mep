@@ -6,13 +6,16 @@ import { INetworkGlpi } from "../interfaces/INetworkGlpiResponse";
 import { DescriptionEnum } from "../enums/DescriptionEnum";
 import lodash from "lodash";
 import { IAlert } from "../interfaces/IAlert";
-import { getAlarmsManual, saveAlert, setIsTCpAlert } from "./MongoDBService";
+import { saveAlert, setIsTCpAlert, handleReactivation, getExistingActiveAlertIds } from "./MongoDBService";
+import { recordSync } from "../models/SyncState";
 import { IAlertHelix } from "../interfaces/IAlertHelix";
 import { FieldEnum } from "../enums/FieldEnum";
 import { format } from "date-fns";
 import { toZonedTime } from "date-fns-tz";
 import { AlertSeverityHelixEnum } from "../enums/AlertSeverityEnum";
 import { sendAlertsToTcp } from "./TcpApiService";
+import CatalogService from "./catalog.service";
+import { log } from "../utils/logger";
 
 type IAlertCiscoGlpi = IAlertCisco & {
     descriptionGlpi: string;
@@ -32,12 +35,15 @@ class ActiveAlertsService {
     maxAlertsToProccess: number;
     alertsProcessedCount: number;
 
+    maxPagesPerCycle: number;
+
     constructor() {
-        this.timeDelay = 10000;
-        this.baseDelay = 10000;
+        this.timeDelay = parseInt(process.env.CISCO_PAGE_DELAY_MS || "5000", 10);
+        this.baseDelay = 5000;
         this.lastAlertId = null;
         this.perPageLimit = 300;
-        this.maxAlertsToProccess = 3000;
+        this.maxAlertsToProccess = parseInt(process.env.CISCO_MAX_ALERTS || "10000", 10);
+        this.maxPagesPerCycle = parseInt(process.env.CISCO_MAX_PAGES || "20", 10);
         this.alertsProcessedCount = 0;
         this.organizationId =  process.env["ORGANIZATION_ID"] || "";
         this.organizationName =  process.env["ORGANIZATION_NAME"] || "";
@@ -51,26 +57,59 @@ class ActiveAlertsService {
     }
 
     async getActiveAlerts () {
+        const t0 = Date.now();
+        let pagesScanned = 0;
+        let totalAlertsSeen = 0;
+        let totalNew = 0;
+        let convergedAt: number | null = null;
         try {
-            const alerts: IAlertCisco[] = [];
             let hasMore = true;
 
-            while (hasMore) {
-                console.log("ACTIVE = Iniciando desde el ultimo AlertID: ", this.lastAlertId?.id);
+            while (hasMore && pagesScanned < this.maxPagesPerCycle) {
                 const result = await this.fetchAlerts();
-                console.log("result.hasMore", result.hasMore)
                 hasMore = result.hasMore;
                 if (result.break) break;
-                result.result.forEach(alertValidate => {
-                      console.log(`ACTIVA: id: ${alertValidate.id} productType:  ${alertValidate.scope.devices[0].productType} type: ${alertValidate.type}  name:${ alertValidate.scope.devices[0].name}`)
+                pagesScanned++;
+                const pageData = result.result;
+                totalAlertsSeen += pageData.length;
+                if (pageData.length === 0) break;
+
+                const ids = pageData.map((a) => a.id);
+                const known = await getExistingActiveAlertIds(ids);
+
+                const inCatalogPage: IAlertCisco[] = [];
+                let notInCatalog = 0;
+                for (const a of pageData) {
+                    const productType = a.scope?.devices?.[0]?.productType ?? "";
+                    if (await CatalogService.hasRule(a.type, productType)) {
+                        inCatalogPage.push(a);
+                    } else {
+                        notInCatalog++;
+                    }
+                }
+
+                const newOrChanged = inCatalogPage.filter((a) => !known.has(a.id));
+                const knownInCatalog = inCatalogPage.length - newOrChanged.length;
+
+                log.info("active.page.scanned", {
+                    page: pagesScanned,
+                    page_size: pageData.length,
+                    not_in_catalog: notInCatalog,
+                    in_catalog: inCatalogPage.length,
+                    already_known: knownInCatalog,
+                    new: newOrChanged.length,
                 });
 
-                alerts.push(...result.result);
-                const validateAlerts = await this.validateAlertsWithGlpi(result.result);
-                const alertsToTcp: IAlert[] = [];
+                if (newOrChanged.length === 0) {
+                    convergedAt = pagesScanned;
+                    log.info("active.converged", { pagesScanned, totalAlertsSeen });
+                    break;
+                }
+
+                totalNew += newOrChanged.length;
+                const validateAlerts = await this.validateAlertsWithGlpi(newOrChanged);
                 const savePromises = validateAlerts.map(
                      async (alertValidate: IAlertCiscoGlpi) => {
-                      // console.log(`ACTIVA: id: ${alertValidate.id} productType:  ${alertValidate.scope.devices[0].productType} type: ${alertValidate.type}  name:${ alertValidate.scope.devices[0].name}`)
                        const alertToSave: IAlert = {
                          alertId: alertValidate.id,
                          organization: {
@@ -95,24 +134,42 @@ class ActiveAlertsService {
                          location: alertValidate.location,
                        };
                        await saveAlert(alertToSave);
-                       alertsToTcp.push(alertToSave);
+                       if (alertToSave.resolvedAt === null || alertToSave.resolvedAt === undefined) {
+                         await handleReactivation(alertToSave.alertId, alertToSave.startedAt);
+                       }
                      }
                    );
                 await Promise.all(savePromises);
-                // await this.validateAndBuildAlertsToSend(alertsToTcp);
-                await this.delay(result.timeDelay);
+                if (hasMore) await this.delay(result.timeDelay);
             }
 
-        } catch (e) {
+            log.info("active.cycle.summary", {
+                ms: Date.now() - t0,
+                pages: pagesScanned,
+                seen: totalAlertsSeen,
+                new: totalNew,
+                converged_at_page: convergedAt,
+                hit_max_pages: pagesScanned >= this.maxPagesPerCycle,
+            });
+
+            await recordSync("cisco_active", {
+                lastPageCount: totalAlertsSeen,
+                lastNewCount: totalNew,
+                lastPagesScanned: pagesScanned,
+                metadata: { converged_at: convergedAt },
+            });
+
+        } catch (e: any) {
             console.error("Error en getActiveAlerts:", e);
+            log.error("active.cycle.error", { message: e?.message });
+            await recordSync("cisco_active", {
+                lastPagesScanned: pagesScanned,
+                lastError: e?.message ?? "unknown",
+            });
         }
 
-        // Resetear contadores para el próximo ciclo
         this.alertsProcessedCount = 0;
         this.lastAlertId = null;
-
-        console.log("### FINALIZADO ACTIVAS - Esperando próximo ciclo ###");
-        await this.delay(30000); // Esperar 30 segundos antes del próximo ciclo
     }
 
     async fetchAlerts() {
@@ -161,7 +218,7 @@ class ActiveAlertsService {
                             return response;
                         }
                     }
-                    
+
                     return response;
                 } else {
                     console.log("ACTIVE = API_MERAKI: Error 429, intentando nuevamente");
@@ -192,7 +249,7 @@ class ActiveAlertsService {
           return retrySeconds * 1000;
         }
       }
-    
+
       return this.baseDelay * retryCount;
     }
 
@@ -240,9 +297,20 @@ class ActiveAlertsService {
     };
 
     async validateAlertsWithGlpi(alerts: IAlertCisco[]){
-         let validateAlerts: IAlertCiscoGlpi[] = [];
+        let validateAlerts: IAlertCiscoGlpi[] = [];
+        let skippedNotInCatalog = 0;
+        let glpiMatched = 0;
+        let glpiUnmatched = 0;
         for (const alertCisco of alerts) {
             try {
+              const productType = alertCisco.scope?.devices?.[0]?.productType ?? "";
+              const type = alertCisco.type;
+              const inCatalog = await CatalogService.hasRule(type, productType);
+              if (!inCatalog) {
+                skippedNotInCatalog++;
+                continue;
+              }
+
               const validationGlpi: {
                 descriptionGlpi: string;
                 isGlpi: boolean;
@@ -251,15 +319,15 @@ class ActiveAlertsService {
               } = await this.validateDeviceNameInGlpi(
                 lodash.defaultTo(alertCisco.scope.devices[0].name, "")
               );
-              if (validationGlpi.isGlpi) {
-                validateAlerts.push({
-                  ...alertCisco,
-                  descriptionGlpi: validationGlpi.descriptionGlpi,
-                  isGlpi: validationGlpi.isGlpi,
-                  comment: validationGlpi.comment,
-                  location: validationGlpi.location,
-                });
-              }
+              validateAlerts.push({
+                ...alertCisco,
+                descriptionGlpi: validationGlpi.descriptionGlpi,
+                isGlpi: validationGlpi.isGlpi,
+                comment: validationGlpi.comment,
+                location: validationGlpi.location,
+              });
+              if (validationGlpi.isGlpi) glpiMatched++;
+              else glpiUnmatched++;
             } catch (error) {
               console.warn(
                 `No se pudo validar el dispositivo: ${alertCisco.scope.devices[0].name}`,
@@ -267,19 +335,25 @@ class ActiveAlertsService {
               );
             }
         }
+        if (skippedNotInCatalog > 0 || glpiUnmatched > 0) {
+          log.info("active.alerts.validation", {
+            received: alerts.length,
+            skipped_not_in_catalog: skippedNotInCatalog,
+            glpi_matched: glpiMatched,
+            glpi_unmatched: glpiUnmatched,
+          });
+        }
         return validateAlerts;
     }
 
     async validateAndBuildAlertsToSend(alerts: IAlert[]) {
         try {
-            // const alerts: IAlert[] = await getAlertsInGlpi();
             const alertsToSend: IAlertHelix[] = await this.validateAlarmManual(alerts);
             const emitAlertsToHelix: { success: number; failed: number } = await sendAlertsToTcp(alertsToSend);
             console.log(`ACTIVE = Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
             const setIsTcp = alertsToSend.map(
                 async (alertIsTcp: { alertId: string }) => {
                     try {
-                        // console.log("isTcp, AlertId: ", alertIsTcp.alertId);
                         await setIsTCpAlert(alertIsTcp.alertId);
                         return (alertIsTcp.alertId);
                     } catch (error) {
@@ -299,20 +373,20 @@ class ActiveAlertsService {
     async validateAlarmManual(alerts: IAlert[]) {
       const tipo: string = process.env.TIPO_ALERTA || FieldEnum.TIPO;
       const fase: string = process.env.FASE_ALERTA || FieldEnum.FASE;
-    
+
       let alertsToSend: IAlertHelix[] = [];
       let alertNotSentCount = 0;
       for (const alert of alerts) {
         try {
-          const alarmManual = await getAlarmsManual(
+          const rule = await CatalogService.getRule(
             alert.type,
             alert.scope.devices[0].productType
           );
-  
-          if (alarmManual.length > 0) {
+
+          if (rule) {
             console.log(`${alert.alertId} | ${ !lodash.isNull(alert.resolvedAt)
                 ? AlertSeverityHelixEnum.CESE
-                : alarmManual[0].severityHelix} | ${alert.resolvedAt}`);
+                : rule.severityHelix} | ${alert.resolvedAt}`);
             alertsToSend.push({
               tipo: tipo,
               idNotificacion: alert.alertId,
@@ -321,12 +395,12 @@ class ActiveAlertsService {
                 : this.formatDateString(alert.startedAt),
               nombreEquipo: alert.scope.devices[0].name,
               ipEquipo: alert.scope.devices[0].mac,
-              causaEvento: alarmManual[0].categoryType,
-              evento: alarmManual[0].title,
+              causaEvento: rule.categoryType,
+              evento: rule.title,
               severidadEvento: !lodash.isNull(alert.resolvedAt)
                 ? AlertSeverityHelixEnum.CESE
-                : alarmManual[0].severityHelix,
-              descripcionEvento: `${alarmManual[0].elementType} - ${alarmManual[0].categoryType} - ${alert.comment}`,
+                : (rule.severityHelix as AlertSeverityHelixEnum),
+              descripcionEvento: `${rule.elementType} - ${rule.categoryType} - ${alert.comment}`,
               nombreCliente: alert.organization.name,
               ubicacion: alert.location,
               fase: fase,
@@ -340,7 +414,6 @@ class ActiveAlertsService {
             `# Error al validar la alerta ${alert.alertId} para envío manual, no se enviará a Helix`,
             error
           );
-          // throw handleError(ErrorCode.E012, alert.alertId);
         }
       }
       return alertsToSend;

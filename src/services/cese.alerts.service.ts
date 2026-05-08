@@ -1,7 +1,8 @@
 import CiscoAlertsService from "./cisco.alerts.service";
 import { AxiosResponse } from "axios";
 import { IAlertCisco } from "../interfaces/IAlertCisco";
-import { getAlarmsManual, getAlertsInGlpi, setIsTCpAlert, updateAlertResolved, saveAlert } from "./MongoDBService";
+import { setIsTCpAlert, updateAlertResolved, saveAlert, getExistingActiveAlertIds, getExistingCesedAlertIds } from "./MongoDBService";
+import { recordSync } from "../models/SyncState";
 import { getNetworkData, getNetworkId, getSessionToken } from "./GlpiAPIService";
 import { IAlert } from "../interfaces/IAlert";
 import { IAlertHelix } from "../interfaces/IAlertHelix";
@@ -13,6 +14,8 @@ import { FieldEnum } from "../enums/FieldEnum";
 import { sendAlertsToTcp } from "./TcpApiService";
 import { INetworkGlpi } from "../interfaces/INetworkGlpiResponse";
 import { DescriptionEnum } from "../enums/DescriptionEnum";
+import CatalogService from "./catalog.service";
+import { log } from "../utils/logger";
 
 type IAlertCiscoGlpi = IAlertCisco & {
     descriptionGlpi: string;
@@ -33,12 +36,15 @@ class CeseAlertsService {
     maxAlertsToProccess: number;
     alertsProcessedCount: number;
 
+    maxPagesPerCycle: number;
+
     constructor() {
-        this.timeDelay = 10000;
-        this.baseDelay = 10000;
+        this.timeDelay = parseInt(process.env.CISCO_PAGE_DELAY_MS || "5000", 10);
+        this.baseDelay = 5000;
         this.lastAlertId = null;
         this.perPageLimit = 300;
-        this.maxAlertsToProccess = 3000;
+        this.maxAlertsToProccess = parseInt(process.env.CISCO_MAX_ALERTS || "10000", 10);
+        this.maxPagesPerCycle = parseInt(process.env.CISCO_MAX_PAGES || "20", 10);
         this.alertsProcessedCount = 0;
         this.organizationId =  process.env["ORGANIZATION_ID"] || "";
         this.organizationName =  process.env["ORGANIZATION_NAME"] || "";
@@ -52,138 +58,154 @@ class CeseAlertsService {
     }
 
     async getCeseAlerts () {
-        while (true) {
-            if (CeseAlertsService.isProcessing) {
-              console.log("⚠️ Ya hay una ejecución en curso, se omite");
-              await this.delay(60000); // Esperar 1 minuto antes del próximo ciclo
-              continue;
-            }
-            
-            CeseAlertsService.isProcessing = true;
-            try {
-            let hasMore = true;
+        if (CeseAlertsService.isProcessing) {
+            log.info("cese.skip", { reason: "already_running" });
+            return;
+        }
+        CeseAlertsService.isProcessing = true;
 
-            while (hasMore) {
+        const t0 = Date.now();
+        let pagesScanned = 0;
+        let totalAlertsSeen = 0;
+        let totalUpdated = 0;
+        let totalNew = 0;
+        let convergedAt: number | null = null;
+
+        try {
+            let hasMore = true;
+            while (hasMore && pagesScanned < this.maxPagesPerCycle) {
                 const result = await this.fetchAlerts();
-                console.log("result.hasMore", result.hasMore)
                 hasMore = result.hasMore;
                 if (result.break) break;
                 const resolvedAlerts = result.result;
-                resolvedAlerts.forEach((a) => {
-                   console.log(`CESE: id: ${a.id} type: ${a.type} item: ${ a.title} desc: ${a.description} resolvedAt: ${a.resolvedAt} device: ${JSON.stringify(a.scope.devices[0].productType)}`)
-                })
-                const allAlerts: IAlert[] = await getAlertsInGlpi();
-                const activeAlerts: IAlert[]  = allAlerts.filter((a) => a.resolvedAt === null);
-                console.log("getCeseAlerts->activeAlerts length", activeAlerts.length);
-                const activeAlertsMap = new Map(
-                  activeAlerts.map((alert) => [alert.alertId, alert])
-                );
-                const allAlertsMap = new Map(
-                  allAlerts.map((alert) => [alert.alertId, alert])
-                );
-                const alertsToTcp: IAlert[] = [];
+                if (resolvedAlerts.length === 0) break;
+                pagesScanned++;
+                totalAlertsSeen += resolvedAlerts.length;
 
-                const alertsToUpdate: { alertId: string; resolvedAt: string }[] =
-                resolvedAlerts.filter(
-                  (resolved) => activeAlertsMap.has(resolved.id) && resolved.resolvedAt
-                )
-                .map((resolved) => {
-                  return {
-                    alertId: resolved.id,
-                    resolvedAt: resolved.resolvedAt!,
-                  };
-                });
-        
-                const updatedPromises = alertsToUpdate.map(
-                    async (alertToUpdate: { alertId: string; resolvedAt: string }) => {
-                        try {
-                        console.log("CESE to updatedPromises, alertId: ", alertToUpdate.alertId, ", resolvedAt: ", alertToUpdate.resolvedAt, alertToUpdate);
-                        const findAlertById = activeAlerts.find((a) => a.alertId === alertToUpdate.alertId);
-                        if (findAlertById){
-                            alertsToTcp.push({...findAlertById, resolvedAt: alertToUpdate.resolvedAt});
-                        }
-                        await updateAlertResolved(
-                          alertToUpdate.alertId,
-                          alertToUpdate.resolvedAt
-                          
-                        );
-                        } catch (error) {
-                            console.error(
-                              `Error al actualizar la alerta ${alertToUpdate.alertId}`,
-                              error
-                            );
-                        }
+                const ids = resolvedAlerts.map((a) => a.id);
+                const [activeIds, cesedIds] = await Promise.all([
+                    getExistingActiveAlertIds(ids),
+                    getExistingCesedAlertIds(ids),
+                ]);
+
+                const inCatalog: IAlertCisco[] = [];
+                let notInCatalog = 0;
+                for (const a of resolvedAlerts) {
+                    const productType = a.scope?.devices?.[0]?.productType ?? "";
+                    if (await CatalogService.hasRule(a.type, productType)) {
+                        inCatalog.push(a);
+                    } else {
+                        notInCatalog++;
                     }
-                );
-                await Promise.allSettled(updatedPromises);
-
-                // Procesar alertas nuevas que no están en el sistema
-                const newAlerts = resolvedAlerts.filter(
-                  (resolved) => !allAlertsMap.has(resolved.id)
-                );
-
-                if (newAlerts.length > 0) {
-                  console.log(`CESE: Procesando ${newAlerts.length} alertas nuevas`);
-                  const validatedNewAlerts = await this.validateAlertsWithGlpi(newAlerts);
-                  
-                  const saveNewAlertsPromises = validatedNewAlerts.map(
-                    async (alertValidate: IAlertCiscoGlpi) => {
-                      try {
-                        const alertToSave: IAlert = {
-                          alertId: alertValidate.id,
-                          organization: {
-                            id: this.organizationId,
-                            name: this.organizationName,
-                          },
-                          categoryType: alertValidate.categoryType,
-                          network: alertValidate.network,
-                          startedAt: alertValidate.startedAt,
-                          dismissedAt: alertValidate.dismissedAt,
-                          resolvedAt: alertValidate.resolvedAt,
-                          deviceType: alertValidate.deviceType,
-                          type: alertValidate.type,
-                          title: alertValidate.title,
-                          description: alertValidate.description || "",
-                          severity: alertValidate.severity,
-                          scope: alertValidate.scope,
-                          descriptionGlpi: alertValidate.descriptionGlpi,
-                          isGlpi: alertValidate.isGlpi,
-                          comment: alertValidate.comment || "",
-                          isTcp: false,
-                          location: alertValidate.location,
-                        };
-                        await saveAlert(alertToSave);
-                        console.log(`CESE: Alerta nueva guardada ${alertValidate.id}`);
-                      } catch (error) {
-                        console.error(
-                          `Error al guardar la alerta nueva ${alertValidate.id}`,
-                          error
-                        );
-                      }
-                    }
-                  );
-                  await Promise.allSettled(saveNewAlertsPromises);
                 }
 
-                // await this.validateAndBuildAlertsToSend(alertsToTcp);
-                await this.delay(result.timeDelay);
+                const toUpdate = inCatalog.filter(
+                    (a) => activeIds.has(a.id) && a.resolvedAt
+                );
+                const newAlerts = inCatalog.filter(
+                    (a) => !activeIds.has(a.id) && !cesedIds.has(a.id)
+                );
+                const alreadyCesed = inCatalog.length - toUpdate.length - newAlerts.length;
+
+                log.info("cese.page.scanned", {
+                    page: pagesScanned,
+                    page_size: resolvedAlerts.length,
+                    not_in_catalog: notInCatalog,
+                    in_catalog: inCatalog.length,
+                    to_update: toUpdate.length,
+                    new: newAlerts.length,
+                    already_cesed: alreadyCesed,
+                });
+
+                if (toUpdate.length === 0 && newAlerts.length === 0) {
+                    convergedAt = pagesScanned;
+                    log.info("cese.converged", { pagesScanned, totalAlertsSeen });
+                    break;
+                }
+
+                if (toUpdate.length > 0) {
+                    const updatedPromises = toUpdate.map(async (resolved) => {
+                        try {
+                            await updateAlertResolved(resolved.id, resolved.resolvedAt!);
+                        } catch (error) {
+                            console.error(`Error al actualizar la alerta ${resolved.id}`, error);
+                        }
+                    });
+                    await Promise.allSettled(updatedPromises);
+                    totalUpdated += toUpdate.length;
+                }
+
+                if (newAlerts.length > 0) {
+                    const validatedNewAlerts = await this.validateAlertsWithGlpi(newAlerts);
+                    const saveNewAlertsPromises = validatedNewAlerts.map(
+                        async (alertValidate: IAlertCiscoGlpi) => {
+                            try {
+                                const alertToSave: IAlert = {
+                                    alertId: alertValidate.id,
+                                    organization: {
+                                        id: this.organizationId,
+                                        name: this.organizationName,
+                                    },
+                                    categoryType: alertValidate.categoryType,
+                                    network: alertValidate.network,
+                                    startedAt: alertValidate.startedAt,
+                                    dismissedAt: alertValidate.dismissedAt,
+                                    resolvedAt: alertValidate.resolvedAt,
+                                    deviceType: alertValidate.deviceType,
+                                    type: alertValidate.type,
+                                    title: alertValidate.title,
+                                    description: alertValidate.description || "",
+                                    severity: alertValidate.severity,
+                                    scope: alertValidate.scope,
+                                    descriptionGlpi: alertValidate.descriptionGlpi,
+                                    isGlpi: alertValidate.isGlpi,
+                                    comment: alertValidate.comment || "",
+                                    isTcp: false,
+                                    location: alertValidate.location,
+                                };
+                                await saveAlert(alertToSave);
+                            } catch (error) {
+                                console.error(`Error al guardar la alerta nueva ${alertValidate.id}`, error);
+                            }
+                        }
+                    );
+                    await Promise.allSettled(saveNewAlertsPromises);
+                    totalNew += newAlerts.length;
+                }
+
+                if (hasMore) await this.delay(result.timeDelay);
             }
 
-        } catch (e) {
+            log.info("cese.cycle.summary", {
+                ms: Date.now() - t0,
+                pages: pagesScanned,
+                seen: totalAlertsSeen,
+                updated: totalUpdated,
+                new: totalNew,
+                converged_at_page: convergedAt,
+                hit_max_pages: pagesScanned >= this.maxPagesPerCycle,
+            });
+
+            await recordSync("cisco_cese", {
+                lastPageCount: totalAlertsSeen,
+                lastNewCount: totalUpdated + totalNew,
+                lastPagesScanned: pagesScanned,
+                metadata: { converged_at: convergedAt, updated: totalUpdated, new: totalNew },
+            });
+        } catch (e: any) {
             console.error("Error en getCeseAlerts:", e);
+            log.error("cese.cycle.error", { message: e?.message });
+            await recordSync("cisco_cese", {
+                lastPagesScanned: pagesScanned,
+                lastError: e?.message ?? "unknown",
+            });
         } finally {
             CeseAlertsService.isProcessing = false;
+            this.alertsProcessedCount = 0;
+            this.lastAlertId = null;
         }
-
-        // Resetear contadores para el próximo ciclo
-        this.alertsProcessedCount = 0;
-        this.lastAlertId = null;
-
-        console.log("### FINALIZADO CESE - Esperando próximo ciclo ###");
-        await this.delay(30000); // Esperar 30 segundos antes del próximo ciclo
     }
-}
-  
+
     async fetchAlerts() {
       let response:{ hasMore: boolean, timeDelay: number, break: boolean, result:IAlertCisco[]} = {
           hasMore: false,
@@ -229,7 +251,7 @@ class CeseAlertsService {
                           return response;
                       }
                   }
-                  
+
                   return response;
               } else {
                   console.log("CESE = API_MERAKI: Error 429, intentando nuevamente");
@@ -260,14 +282,12 @@ class CeseAlertsService {
 
     async validateAndBuildAlertsToSend(alerts: IAlert[]) {
         try {
-            // const alerts: IAlert[] = await getAlertsInGlpi();
             const alertsToSend: IAlertHelix[] = await this.validateAlarmManual(alerts);
             const emitAlertsToHelix: { success: number; failed: number } = await sendAlertsToTcp(alertsToSend);
             console.log(`CESE = Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
             const setIsTcp = alertsToSend.map(
                 async (alertIsTcp: { alertId: string }) => {
                     try {
-                        // console.log("CESE = isTcp, AlertId: ", alertIsTcp.alertId);
                         await setIsTCpAlert(alertIsTcp.alertId);
                         return (alertIsTcp.alertId);
                     } catch (error) {
@@ -287,20 +307,20 @@ class CeseAlertsService {
     async validateAlarmManual(alerts: IAlert[]) {
           const tipo: string = process.env.TIPO_ALERTA || FieldEnum.TIPO;
           const fase: string = process.env.FASE_ALERTA || FieldEnum.FASE;
-        
+
           let alertsToSend: IAlertHelix[] = [];
           let alertNotSentCount = 0;
           for (const alert of alerts) {
             try {
-              const alarmManual = await getAlarmsManual(
+              const rule = await CatalogService.getRule(
                 alert.type,
                 alert.scope.devices[0].productType
               );
-    
-              if (alarmManual.length > 0) {
+
+              if (rule) {
                  console.log(`${alert.alertId} | ${ !lodash.isNull(alert.resolvedAt)
                 ? AlertSeverityHelixEnum.CESE
-                : alarmManual[0].severityHelix} | ${alert.resolvedAt}`);
+                : rule.severityHelix} | ${alert.resolvedAt}`);
                 alertsToSend.push({
                   tipo: tipo,
                   idNotificacion: alert.alertId,
@@ -309,12 +329,12 @@ class CeseAlertsService {
                     : this.formatDateString(alert.startedAt),
                   nombreEquipo: alert.scope.devices[0].name,
                   ipEquipo: alert.scope.devices[0].mac,
-                  causaEvento: alarmManual[0].categoryType,
-                  evento: alarmManual[0].title,
+                  causaEvento: rule.categoryType,
+                  evento: rule.title,
                   severidadEvento: !lodash.isNull(alert.resolvedAt)
                     ? AlertSeverityHelixEnum.CESE
-                    : alarmManual[0].severityHelix,
-                  descripcionEvento: `${alarmManual[0].elementType} - ${alarmManual[0].categoryType} - ${alert.comment}`,
+                    : (rule.severityHelix as AlertSeverityHelixEnum),
+                  descripcionEvento: `${rule.elementType} - ${rule.categoryType} - ${alert.comment}`,
                   nombreCliente: alert.organization.name,
                   ubicacion: alert.location,
                   fase: fase,
@@ -328,12 +348,11 @@ class CeseAlertsService {
                 `Error al validar la alerta ${alert.alertId} para envío manual, no se enviará a Helix`,
                 error
               );
-              // throw handleError(ErrorCode.E012, alert.alertId);
             }
           }
           return alertsToSend;
         }
-    
+
         async validateDeviceNameInGlpi(
       nameDevice: string
     ): Promise<{
@@ -379,8 +398,19 @@ class CeseAlertsService {
 
     async validateAlertsWithGlpi(alerts: IAlertCisco[]): Promise<IAlertCiscoGlpi[]> {
       let validateAlerts: IAlertCiscoGlpi[] = [];
+      let skippedNotInCatalog = 0;
+      let glpiMatched = 0;
+      let glpiUnmatched = 0;
       for (const alertCisco of alerts) {
         try {
+          const productType = alertCisco.scope?.devices?.[0]?.productType ?? "";
+          const type = alertCisco.type;
+          const inCatalog = await CatalogService.hasRule(type, productType);
+          if (!inCatalog) {
+            skippedNotInCatalog++;
+            continue;
+          }
+
           const validationGlpi: {
             descriptionGlpi: string;
             isGlpi: boolean;
@@ -389,15 +419,15 @@ class CeseAlertsService {
           } = await this.validateDeviceNameInGlpi(
             lodash.defaultTo(alertCisco.scope.devices[0].name, "")
           );
-          if (validationGlpi.isGlpi) {
-            validateAlerts.push({
-              ...alertCisco,
-              descriptionGlpi: validationGlpi.descriptionGlpi,
-              isGlpi: validationGlpi.isGlpi,
-              comment: validationGlpi.comment,
-              location: validationGlpi.location,
-            });
-          }
+          validateAlerts.push({
+            ...alertCisco,
+            descriptionGlpi: validationGlpi.descriptionGlpi,
+            isGlpi: validationGlpi.isGlpi,
+            comment: validationGlpi.comment,
+            location: validationGlpi.location,
+          });
+          if (validationGlpi.isGlpi) glpiMatched++;
+          else glpiUnmatched++;
         } catch (error) {
           console.warn(
             `CESE: No se pudo validar el dispositivo: ${alertCisco.scope.devices[0].name}`,
@@ -405,12 +435,20 @@ class CeseAlertsService {
           );
         }
       }
+      if (skippedNotInCatalog > 0 || glpiUnmatched > 0) {
+        log.info("cese.alerts.validation", {
+          received: alerts.length,
+          skipped_not_in_catalog: skippedNotInCatalog,
+          glpi_matched: glpiMatched,
+          glpi_unmatched: glpiUnmatched,
+        });
+      }
       return validateAlerts;
     }
 
     formatDateString(dateString: string | null): string {
             if (dateString === null) return "";
-    
+
             const timeZone = "America/Costa_Rica";
             const date = new Date(dateString);
             const zonedDate = toZonedTime(date, timeZone);

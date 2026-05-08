@@ -5,11 +5,11 @@ import {
   getListOfResolvedAlerts,
 } from "../services/CiscoMerakiAPIService";
 import {
-  getAlarmsManual,
-  getAlertsInGlpi,
+  getPendingAlertsForSend,
   saveAlert,
   setIsTCpAlert,
   updateAlertResolved,
+  getAlertsInGlpi,
 } from "../services/MongoDBService";
 import { format } from "date-fns";
 import { toZonedTime } from "date-fns-tz";
@@ -23,9 +23,9 @@ import { DescriptionEnum } from "../enums/DescriptionEnum";
 import { IAlertHelix } from "../interfaces/IAlertHelix";
 import { FieldEnum } from "../enums/FieldEnum";
 import { AlertSeverityHelixEnum } from "../enums/AlertSeverityEnum";
-// import { handleError } from "../handlers/ErrorHandler";
-// import { ErrorCode } from "../enums/ErrorEnum";
 import { sendAlertsToTcp } from "../services/TcpApiService";
+import CatalogService from "../services/catalog.service";
+import { log } from "../utils/logger";
 import lodash from "lodash";
 
 export const getAndSaveActiveAlerts = async () => {
@@ -42,9 +42,16 @@ export const getAndSaveActiveAlerts = async () => {
       location: string;
     };
     let validateAlerts: IAlertCiscoGlpi[] = [];
+    let skippedNotInCatalog = 0;
 
     for (const alertCisco of ciscoAlerts) {
       try {
+        const productType = alertCisco.scope?.devices?.[0]?.productType ?? "";
+        const inCatalog = await CatalogService.hasRule(alertCisco.type, productType);
+        if (!inCatalog) {
+          skippedNotInCatalog++;
+          continue;
+        }
         const validationGlpi: {
           descriptionGlpi: string;
           isGlpi: boolean;
@@ -68,6 +75,12 @@ export const getAndSaveActiveAlerts = async () => {
           error
         );
       }
+    }
+    if (skippedNotInCatalog > 0) {
+      log.info("saa.alerts.skipped.notInCatalog", {
+        skipped: skippedNotInCatalog,
+        received: ciscoAlerts.length,
+      });
     }
 
     const savePromises = validateAlerts.map(
@@ -149,89 +162,134 @@ const validateDeviceNameInGlpi = async (
   }
 };
 
+interface IBuiltAlert {
+  payload: IAlertHelix;
+  expectedResolvedAt: string | null;
+}
+
 export const validateAndBuildAlertsToSend = async () => {
   try {
-    const alerts: IAlert[] = await getAlertsInGlpi();
-    const alertsFiltered: IAlert[] = alerts.filter((a) => a.isTcp === false);
-    console.log("Cantidad de alertas en GLPI para validar y enviar: ", alertsFiltered?.length, new Date(Date.now()).toLocaleString('es-CO'));
+    const alertsFiltered: IAlert[] = await getPendingAlertsForSend(1000);
+    console.log("Cantidad de alertas pendientes: ", alertsFiltered?.length, new Date(Date.now()).toLocaleString('es-CO'));
 
-    const alertsToSend: IAlertHelix[] = await validateAlarmManual(alertsFiltered);
-    console.log("Alertas a enviar: ", alertsToSend.length, new Date(Date.now()).toLocaleString('es-CO'));
+    const built: IBuiltAlert[] = await buildAlertsForHelix(alertsFiltered);
+    console.log("Alertas a enviar: ", built.length, new Date(Date.now()).toLocaleString('es-CO'));
 
+    if (built.length === 0) {
+      log.info("send.cron.summary", {
+        received: alertsFiltered.length,
+        built: 0,
+        tcp_success: 0,
+        tcp_failed: 0,
+        claimed: 0,
+        race_lost: 0,
+        catalog: CatalogService.stats(),
+      });
+      return;
+    }
+
+    const payloads: IAlertHelix[] = built.map((b) => b.payload);
     const emitAlertsToHelix: { success: number; failed: number } =
-      await sendAlertsToTcp(alertsToSend);
+      await sendAlertsToTcp(payloads);
     console.log(`Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
-    
-    const setIsTcp = alertsToSend.map(
-      async (alertIsTcp: { alertId: string }) => {
-        try {
-          await setIsTCpAlert(alertIsTcp.alertId);
-        } catch (error) {
-          console.error(
-            `Error al setear isTcp en la alerta ${alertIsTcp.alertId}`,
-            error
-          );
-        }
+
+    let claimed = 0;
+    let raceLost = 0;
+    if (emitAlertsToHelix.failed === 0) {
+      const claimResults = await Promise.allSettled(
+        built.map(async (b) => {
+          const ok = await setIsTCpAlert(b.payload.alertId, b.expectedResolvedAt);
+          return ok !== null;
+        })
+      );
+      for (const r of claimResults) {
+        if (r.status === "fulfilled" && r.value) claimed++;
+        else raceLost++;
       }
-    );
+    } else {
+      log.warn("send.cron.tcp_failed.skipping_claim", {
+        failed: emitAlertsToHelix.failed,
+        success: emitAlertsToHelix.success,
+      });
+    }
 
-    await Promise.allSettled(setIsTcp);
-
-    console.log(
-      `${emitAlertsToHelix.success} alertas emitidas satisfactorias y ${emitAlertsToHelix.failed} fallidas al servidor TCP`
-    );
+    log.info("send.cron.summary", {
+      received: alertsFiltered.length,
+      built: built.length,
+      tcp_success: emitAlertsToHelix.success,
+      tcp_failed: emitAlertsToHelix.failed,
+      claimed,
+      race_lost: raceLost,
+      catalog: CatalogService.stats(),
+    });
   } catch (error) {
     console.log(error);
+    log.error("send.cron.error", { message: (error as Error)?.message });
   }
 };
 
-async function validateAlarmManual(alerts: IAlert[]) {
+async function buildAlertsForHelix(alerts: IAlert[]): Promise<IBuiltAlert[]> {
   const tipo: string = process.env.TIPO_ALERTA || FieldEnum.TIPO;
   const fase: string = process.env.FASE_ALERTA || FieldEnum.FASE;
 
-  let alertsToSend: IAlertHelix[] = [];
+  const built: IBuiltAlert[] = [];
   let alertNotSentCount = 0;
+  let skippedNotInCatalog = 0;
   for (const alert of alerts) {
     try {
-      const alarmManual = await getAlarmsManual(
+      const rule = await CatalogService.getRule(
         alert.type,
         alert.scope.devices[0].productType
       );
-      // console.log("validateAlarmManual name:", alert.scope.devices[0].name, " - ",alert.alertId, "- productType: ", alert.scope.devices[0].productType, " type:", alert.type, " alarmManual:", alarmManual[0]?.productType, " CESE? ", !lodash.isNull(alert.resolvedAt))
 
-      if (alarmManual.length > 0) {
-        alertsToSend.push({
-          tipo: tipo,
-          idNotificacion: alert.alertId,
-          fechaHora: !lodash.isNull(alert.resolvedAt)
-            ? formatDateString(alert.resolvedAt)
-            : formatDateString(alert.startedAt),
-          nombreEquipo: alert.scope.devices[0].name,
-          ipEquipo: alert.scope.devices[0].mac,
-          causaEvento: alarmManual[0].categoryType,
-          evento: alarmManual[0].title,
-          severidadEvento: !lodash.isNull(alert.resolvedAt)
-            ? AlertSeverityHelixEnum.CESE
-            : alarmManual[0].severityHelix,
-          descripcionEvento: `${alarmManual[0].elementType} - ${alarmManual[0].categoryType} - ${alert.comment}`,
-          nombreCliente: alert.organization.name,
-          ubicacion: alert.location,
-          fase: fase,
-          alertId: alert.alertId,
-          organization: alert.organization,
+      if (rule) {
+        const isCese = !lodash.isNull(alert.resolvedAt);
+        built.push({
+          expectedResolvedAt: alert.resolvedAt ?? null,
+          payload: {
+            tipo: tipo,
+            idNotificacion: alert.alertId,
+            fechaHora: isCese
+              ? formatDateString(alert.resolvedAt!)
+              : formatDateString(alert.startedAt),
+            nombreEquipo: alert.scope.devices[0].name,
+            ipEquipo: alert.scope.devices[0].mac,
+            causaEvento: rule.categoryType,
+            evento: rule.title,
+            severidadEvento: isCese
+              ? AlertSeverityHelixEnum.CESE
+              : (rule.severityHelix as AlertSeverityHelixEnum),
+            descripcionEvento: `${rule.elementType} - ${rule.categoryType} - ${alert.comment}`,
+            nombreCliente: alert.organization.name,
+            ubicacion: alert.location,
+            fase: fase,
+            alertId: alert.alertId,
+            organization: alert.organization,
+          },
         });
+      } else {
+        skippedNotInCatalog++;
       }
     } catch (error) {
-      alertNotSentCount = alertNotSentCount +1;
+      alertNotSentCount = alertNotSentCount + 1;
       console.error(
         `Error al validar la alerta ${alert.alertId} para envío manual, no se enviará a Helix`,
         error
       );
-      // throw handleError(ErrorCode.E012, alert.alertId);
     }
   }
-  console.log(`Total alertas a enviar: ${alertsToSend.length}. Alertas no enviadas por error: ${alertNotSentCount}, `, new Date(Date.now()).toLocaleString('es-CO'));
-  return alertsToSend;
+  if (skippedNotInCatalog > 0) {
+    log.info("send.cron.skipped.notInCatalog", {
+      skipped: skippedNotInCatalog,
+      total: alerts.length,
+      sent: built.length,
+    });
+  }
+  console.log(
+    `Total alertas a enviar: ${built.length}. No enviadas por error: ${alertNotSentCount}. Sin catálogo: ${skippedNotInCatalog}`,
+    new Date(Date.now()).toLocaleString("es-CO")
+  );
+  return built;
 }
 
 function formatDateString(dateString: string): string {

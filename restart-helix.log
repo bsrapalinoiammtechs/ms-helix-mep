@@ -1,5 +1,5 @@
 Reiniciando ms-helix-mep3...
-time="2026-05-07T08:00:01Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-05-08T08:00:01Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
  Container ms-helix-mep  Stopping
  Container ms-helix-mep  Stopped
  Container ms-helix-mep  Removing
@@ -10,15 +10,15 @@ time="2026-05-07T08:00:01Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-co
  Container mongodb-helix-mep  Removed
  Network ms-helix-mep3_ms-helix-network  Removing
  Network ms-helix-mep3_ms-helix-network  Removed
-time="2026-05-07T08:00:13Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+time="2026-05-08T08:00:13Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
 #0 building with "default" instance using docker driver
 
 #1 [ms-helix-mep internal] load build definition from Dockerfile
-#1 transferring dockerfile: 216B done
+#1 transferring dockerfile: 216B 0.0s done
 #1 DONE 0.0s
 
 #2 [ms-helix-mep internal] load metadata for docker.io/library/node:20-alpine
-#2 DONE 0.9s
+#2 DONE 1.0s
 
 #3 [ms-helix-mep internal] load .dockerignore
 #3 transferring context: 78B done
@@ -28,8 +28,8 @@ time="2026-05-07T08:00:13Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-co
 #4 DONE 0.0s
 
 #5 [ms-helix-mep internal] load build context
-#5 transferring context: 10.56kB 0.0s done
-#5 DONE 0.0s
+#5 transferring context: 185.44kB 0.1s done
+#5 DONE 0.1s
 
 #6 [ms-helix-mep 2/6] WORKDIR /app
 #6 CACHED
@@ -41,23 +41,23 @@ time="2026-05-07T08:00:13Z" level=warning msg="/home/pbs/ms-helix-mep3/docker-co
 #8 CACHED
 
 #9 [ms-helix-mep 5/6] COPY . .
-#9 DONE 0.1s
+#9 DONE 0.2s
 
 #10 [ms-helix-mep 6/6] RUN npm run build
-#10 0.838 
-#10 0.838 > ms-helix@1.0.0 build
-#10 0.838 > tsc
-#10 0.838 
-#10 3.708 npm notice
-#10 3.708 npm notice New major version of npm available! 10.8.2 -> 11.14.0
-#10 3.708 npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.14.0
-#10 3.708 npm notice To update run: npm install -g npm@11.14.0
-#10 3.708 npm notice
-#10 DONE 3.7s
+#10 1.016 
+#10 1.016 > ms-helix@1.0.0 build
+#10 1.016 > tsc
+#10 1.016 
+#10 4.103 npm notice
+#10 4.103 npm notice New major version of npm available! 10.8.2 -> 11.14.0
+#10 4.103 npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.14.0
+#10 4.103 npm notice To update run: npm install -g npm@11.14.0
+#10 4.103 npm notice
+#10 DONE 4.2s
 
 #11 [ms-helix-mep] exporting to image
-#11 exporting layers 0.0s done
-#11 writing image sha256:f2f0a52af7d80b0a7db92009b3bcdc804e7ff519e0fff736d35253eae7dd8f45 done
+#11 exporting layers 0.1s done
+#11 writing image sha256:2506e57517db77c84d080ce26ca6a7d7d1286dcf16c0c8cb720fa5f16bba338d done
 #11 naming to docker.io/library/ms-helix-mep3-ms-helix-mep done
 #11 DONE 0.1s
 
