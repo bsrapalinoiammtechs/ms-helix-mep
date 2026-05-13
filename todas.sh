@@ -6,7 +6,7 @@ BASE="https://api.meraki.com/api/v1/organizations/${ORG}/assurance/alerts"
 PERPAGE=300
 
 # Empezamos en la primera página
-next_url="${BASE}?perPage=${PERPAGE}&sortOrder=descending&resolved=false&active=true"
+next_url="${BASE}?perPage=${PERPAGE}&sortOrder=descending&resolved=true&active=false"
 
 while [[ -n "$next_url" ]]; do
   # 1) Llamamos al endpoint, separados headers y body
@@ -30,7 +30,7 @@ while [[ -n "$next_url" ]]; do
 
   # 4) Sacamos el último ID de esta página y armamos la siguiente URL
   last_id=$(jq -r '.[-1].id' "$tmp_b")
-  next_url="${BASE}?perPage=${PERPAGE}&sortOrder=descending&resolved=false&active=true&startingAfter=${last_id}"
+  next_url="${BASE}?perPage=${PERPAGE}&sortOrder=descending&resolved=true&active=false&startingAfter=${last_id}"
 
   # 5) Limpieza de temporales
   rm "$tmp_h" "$tmp_b"

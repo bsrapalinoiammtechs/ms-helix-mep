@@ -1,9 +1,10 @@
 import axios, { AxiosResponse } from "axios";
 import { IAlertCisco } from "../interfaces/IAlertCisco";
+import { log } from "../utils/logger";
 
 const DEFAULT_PER_PAGE = 300;
 const DEFAULT_SORT_ORDER = "descending";
-const MAX_RETRIES = 2;
+const MAX_RETRIES = parseInt(process.env.CISCO_429_MAX_RETRIES || "5", 10);
 const RETRY_BASE_DELAY_MS = 5000;
 const PAGE_DELAY_MS = 2000;
 
@@ -80,16 +81,19 @@ async function fetchAllAlerts(params: Record<string, any>, enableRefetch: boolea
     if (response.status === 429) {
       retryCount += 1;
       if (retryCount > MAX_RETRIES) {
-        console.warn(
-          `🚨 [MERAKI API] Límite de solicitudes alcanzado tras ${MAX_RETRIES} intentos. Se conservan ${allAlerts.length} alertas recolectadas.`,
-        );
+        log.warn("cisco_module.429.exhausted", {
+          max_retries: MAX_RETRIES,
+          collected: allAlerts.length,
+        });
         break;
       }
 
       const waitTimeMs = getRetryDelay(response, retryCount);
-      console.warn(
-        `⏳ [MERAKI API] Rate limit. Reintentando en ${waitTimeMs} ms (intento ${retryCount}/${MAX_RETRIES})`,
-      );
+      log.warn("cisco_module.429.retry", {
+        attempt: retryCount,
+        max_retries: MAX_RETRIES,
+        wait_ms: waitTimeMs,
+      });
       await delay(waitTimeMs);
       continue;
     }

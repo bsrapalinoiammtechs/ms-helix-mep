@@ -49,11 +49,17 @@ class CeseAlertsService {
         this.organizationId =  process.env["ORGANIZATION_ID"] || "";
         this.organizationName =  process.env["ORGANIZATION_NAME"] || "";
 
+        // Nota: NO pasar sortBy explícito. Probado 2026-05-12: con
+        // sortBy=resolvedAt + sortOrder=descending, Cisco devuelve registros
+        // con resolvedAt:null al inicio (NULL tratado como > toda fecha),
+        // imposibilitando el procesamiento de cesaciones reales.
+        // El default de Cisco para resolved=true sí ordena por resolvedAt desc
+        // y excluye los nulls — ese es el comportamiento que queremos.
         this.apiMeraki = new CiscoAlertsService({
             active: false,
             resolved: true,
             perPage: 300,
-            sortOrder: "descending"
+            sortOrder: "descending",
         });
     }
 
@@ -77,7 +83,20 @@ class CeseAlertsService {
                 const result = await this.fetchAlerts();
                 hasMore = result.hasMore;
                 if (result.break) break;
-                const resolvedAlerts = result.result;
+                // Filtro defensivo: descartar registros sin resolvedAt aunque
+                // Cisco los marque como `resolved=true`. Cisco puede devolver
+                // alertas dismissed o en estados intermedios con resolvedAt:null
+                // bajo ciertos ordenamientos; intentar cesar con resolvedAt:null
+                // dejaría la alerta en un estado inconsistente en MEP DB.
+                const rawPage = result.result;
+                const droppedNullResolvedAt = rawPage.filter((a) => !a.resolvedAt).length;
+                const resolvedAlerts = rawPage.filter((a) => !!a.resolvedAt);
+                if (droppedNullResolvedAt > 0) {
+                    log.warn("cese.page.dropped_null_resolvedAt", {
+                        dropped: droppedNullResolvedAt,
+                        kept: resolvedAlerts.length,
+                    });
+                }
                 if (resolvedAlerts.length === 0) break;
                 pagesScanned++;
                 totalAlertsSeen += resolvedAlerts.length;
@@ -224,9 +243,13 @@ class CeseAlertsService {
               };
           }
 
-          let result: AxiosResponse<IAlertCisco[]>;
+          let result: AxiosResponse<IAlertCisco[]> | null;
           const alerts: IAlertCisco[] = [];
               result = await this.apiMeraki.getAllMerakiAlertsApi(this.lastAlertId?.id);
+              if (!result) {
+                  log.warn("cese.fetch.network_error");
+                  return { hasMore: false, timeDelay: 0, break: true, result: [] };
+              }
                if (result.status === 200) {
                   const pageData = Array.isArray(result.data) ? result.data : [];
                   alerts.push(...pageData);
@@ -254,16 +277,21 @@ class CeseAlertsService {
 
                   return response;
               } else {
-                  console.log("CESE = API_MERAKI: Error 429, intentando nuevamente");
-                  response.break = false;
-                  response.hasMore = true;
-                  response.timeDelay =  5000;
+                  // El cliente ya hizo retry interno con backoff respetando Retry-After.
+                  // Llegar aquí significa status inesperado (4xx no-429, 5xx) o 429 con
+                  // budget de retries agotado. Cortar el ciclo y dejar que el próximo
+                  // tick del cron retome desde cero.
+                  log.warn("cese.fetch.unexpected_status", { status: result.status });
+                  response.break = true;
+                  response.hasMore = false;
+                  response.timeDelay = 0;
                   return response;
               }
-      } catch (e) {
-               response.hasMore = true;
-               response.break = false;
-               response.timeDelay =  5000;
+      } catch (e: any) {
+               log.error("cese.fetch.exception", { message: e?.message });
+               response.hasMore = false;
+               response.break = true;
+               response.timeDelay = 0;
                return response;
       }
   }
