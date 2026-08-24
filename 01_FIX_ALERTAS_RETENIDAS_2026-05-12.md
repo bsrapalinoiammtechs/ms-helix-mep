@@ -755,7 +755,26 @@ También se encontró un campo `cursor: string; //number` en `IAlertCisco.ts`, d
 
 **Lo que esto NO resuelve:** los secretos que ya estaban en el historial de git (commits viejos) siguen ahí -- sacar `.env` del tracking de acá en adelante no los borra del historial. Si se quiere purgar el historial completo (ej. con `git filter-repo`/BFG), es una operación aparte, coordinada, que reescribe hashes de commits -- no se hizo en esta fase. Recomendación aparte: rotar `TOKEN_CISCO`/credenciales de GLPI en algún momento, dado que ya estuvieron expuestas en el historial.
 
-**Pendiente (idea del usuario, no implementada aún):** parametrizar `docker-compose.yml` (nombres de servicio/contenedor, puertos) por variable de entorno en vez de hardcodearlos por organización, para que una organización nueva no requiera editar el compose a mano. Queda como mejora de arquitectura para después, fuera de alcance de esta fase.
+#### D.6 — `docker-compose.yml` parametrizado por organización  ✅ (2026-08-24)
+
+Implementada la idea pendiente de D.5: `docker-compose.yml` ya no tiene nombres hardcodeados por organización (`mongodb-helix-mep`, `ms-helix-mep`, puerto `3005`, etc.). Ahora usa variables de `.env`:
+
+| Variable nueva | Uso |
+|---|---|
+| `ORG_SLUG` | Sufijo de `container_name` en los 3 servicios (`mongodb-helix-${ORG_SLUG}`, `redis-helix-${ORG_SLUG}`, `ms-helix-${ORG_SLUG}`) |
+| `MONGO_LOCAL_PORT` | Puerto publicado al host para Mongo (antes hardcodeado: 27023 en mep, 27022 en taboga, etc.) |
+| `REDIS_LOCAL_PORT` | Puerto publicado al host para Redis (nuevo en Fase D, antes hardcodeado a 6380) |
+| `HTTP_PORT` (ya existía) | Reusado también para el mapeo de puerto publicado (`${HTTP_PORT}:${HTTP_PORT}`) -- antes el compose tenía el puerto hardcodeado por separado del que lee la app, sin garantía de que coincidieran |
+
+**Las claves de servicio del YAML (`mongodb-helix`, `redis-helix`, `ms-helix`) y el volumen (`mongodb_data`) se dejaron fijos, sin interpolar.** No hacía falta variarlos: Docker Compose namespacea volúmenes/redes automáticamente por carpeta/proyecto (el mismo mecanismo que causó el incidente de D.1 al mover la canario a otra carpeta), y las claves de servicio no determinan el nombre real del contenedor -- eso lo hace `container_name`, que sí se parametrizó. Evita además cualquier duda sobre si Compose interpola nombres de clave YAML (no es un comportamiento universalmente garantizado entre versiones; interpolar solo valores sí lo es).
+
+**Resultado:** `docker-compose.yml` puede quedar **idéntico en las 7 organizaciones** de ahora en adelante -- ya no hace falta editarlo a mano por organización, solo su `.env`. Esto elimina la fuente del conflicto de merge que se iba a repetir en cada una de las 6 organizaciones restantes.
+
+**Aplicado a mep3:** `.env` real actualizado con `ORG_SLUG=mep`, `MONGO_LOCAL_PORT=27023`, `REDIS_LOCAL_PORT=6380` (los mismos valores que ya tenía hardcodeados), y `MONGO_DB` actualizado para apuntar al nuevo hostname fijo `mongodb-helix` (antes `mongodb-helix-mep`) -- sin cambio de comportamiento real, solo de dónde vive el valor.
+
+**Validado:** YAML sintácticamente válido (`js-yaml` parse limpio). **No probado contra Docker real todavía** -- validar `docker compose config` (resuelve las variables) y un `docker compose up -d --build` real en mep3 antes de asumir que funciona, ya que no hay Docker disponible en el entorno donde se escribió este cambio.
+
+**Pendiente para las 6 organizaciones restantes:** al traer este commit (vía el merge cuidadoso ya en curso), cada organización necesita agregar `ORG_SLUG`/`MONGO_LOCAL_PORT`/`REDIS_LOCAL_PORT` a su `.env` real (valores ya usados hoy: taboga=taboga/27022/‹asignar›, y así con las demás) antes de poder tirar su `docker-compose.yml` personalizado y adoptar este genérico.
 
 ## 7. Historial de cambios
 
