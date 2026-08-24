@@ -1,47 +1,58 @@
 version: "2.4"
+
+# Parametrizado por organización vía .env (ORG_SLUG, HTTP_PORT,
+# MONGO_LOCAL_PORT, REDIS_LOCAL_PORT) -- ver .env.example. Los nombres de
+# servicio (claves de este YAML: mongodb-helix, redis-helix, ms-helix) se
+# dejan fijos a propósito -- Docker Compose namespacea automáticamente por
+# carpeta/proyecto (por eso cada organización ya vive en su propia
+# carpeta), así que no hace falta variarlos para evitar colisiones. Lo
+# único que SÍ debe ser único por organización es `container_name` (no se
+# namespacea solo, es justo lo que causó el choque de nombres al mover la
+# canario de mep a otra carpeta) y los puertos publicados al host (todas
+# las organizaciones comparten el mismo host).
 services:
-  mongodb-helix-mep:
+  mongodb-helix:
     image: mongo:latest
     restart: always
-    container_name: mongodb-helix-mep
+    container_name: mongodb-helix-${ORG_SLUG}
     environment:
       MONGO_INITDB_ROOT_USERNAME: andrair
       MONGO_INITDB_ROOT_PASSWORD: 1234
     ports:
-      - "27023:27017" # Para acceder a MongoDB desde tu máquina local
+      - "${MONGO_LOCAL_PORT}:27017" # Para acceder a MongoDB desde tu máquina local
     volumes:
-      - mongodb_data_mep:/data/db
+      - mongodb_data:/data/db
     networks:
       - ms-helix-network
 
   # Redis propio de esta organización, solo para el gateway de rate-limit
-  # hacia Meraki (BullMQ). No se comparte con las otras 6 organizaciones ni
+  # hacia Meraki (BullMQ). No se comparte con las otras organizaciones ni
   # con la infraestructura de Epistech -- cada organización mantiene su
-  # stack aislado, igual que ya pasa con mongodb-helix-mep.
-  redis-helix-mep:
+  # stack aislado, igual que ya pasa con mongodb-helix.
+  redis-helix:
     image: redis:7-alpine
     restart: always
-    container_name: redis-helix-mep
+    container_name: redis-helix-${ORG_SLUG}
     ports:
-      - "6380:6379" # Para acceder a Redis desde tu máquina local
+      - "${REDIS_LOCAL_PORT}:6379" # Para acceder a Redis desde tu máquina local
     networks:
       - ms-helix-network
 
-  ms-helix-mep:
+  ms-helix:
     build:
       context: ./
-    container_name: ms-helix-mep
+    container_name: ms-helix-${ORG_SLUG}
     #mem_limit: 12g
     restart: always
     env_file:
       - .env
     environment:
-      - REDIS_URL=redis://redis-helix-mep:6379
+      - REDIS_URL=redis://redis-helix-${ORG_SLUG}:6379
     ports:
-      - "3005:3005"
+      - "${HTTP_PORT}:${HTTP_PORT}"
     depends_on:
-      - mongodb-helix-mep
-      - redis-helix-mep
+      - mongodb-helix
+      - redis-helix
     networks:
       - ms-helix-network
     command: node --max-old-space-size=10240 build/index.js
@@ -51,4 +62,4 @@ networks:
     driver: bridge
 
 volumes:
-  mongodb_data_mep:
+  mongodb_data:
