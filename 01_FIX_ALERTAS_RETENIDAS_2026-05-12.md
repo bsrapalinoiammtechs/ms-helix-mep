@@ -679,6 +679,17 @@ axios.get("https://api.meraki.com/api/v1/organizations/846353/assurance/alerts",
 
 **No incluido en esta fase (fuera de alcance, evaluar después):** unificar `CISCO_PAGE_DELAY_MS`/`RECONCILIATION_RATE_DELAY_MS` en una sola variable, y limpiar código muerto (`src/queues/alerts.queues.ts`, `src/workers/alerts.worker.ts`, `src/services/CiscoMerakiAPIService.ts` + `getAndSaveActiveAlerts` en `FlowFunctions.ts`, y los archivos `*copy*`/`*TODAS*`/`*20260324*` sueltos en `src/`) — no afectan el fix actual.
 
+#### D.0 — Hallazgo: rate-limit compartido por IP entre las 7 organizaciones  ✅ confirmado (2026-08-24)
+
+La [documentación oficial de Meraki](https://developer.cisco.com/meraki/api-v1/rate-limit/) especifica **dos** límites, no uno:
+
+- **10 req/s por organización** (con ráfaga de +10 en el primer segundo).
+- **100 req/s por IP de origen, compartido entre TODAS las organizaciones que salgan por esa IP** — independiente del token/API key usado.
+
+`docker ps -a` en el host confirmó que **las 7 organizaciones corren simultáneamente en el mismo host** (mep, taboga, frutera, adifort, acs2, munici-cr, volcano), todas saliendo por la misma IP pública. Mientras solo `mep3` tiene el gateway BullMQ (Fase D), las otras 6 siguen con el código viejo -- su tráfico combinado puede empujar el techo compartido de 100 req/s, causando 429 en `mep3` **aunque esté bien dentro de su propio presupuesto de 10 req/s**. Esto confirma y afina exactamente el diagnóstico del informe técnico ya enviado al cliente ("concurrencia de consultas sobre varias organizaciones de Meraki").
+
+**Implicación directa:** el fix de Fase D necesita desplegarse en **las 7 organizaciones**, no solo en la canario, para resolver el problema por completo. Con las 7 paceando a ~1 petición/11s cada una, el total combinado (~0.6 req/s) queda muy por debajo del techo compartido de 100/s. Observar más tiempo solo en `mep3` no es suficiente si la perturbación viene de las otras 6.
+
 #### D.1 — Validación en canario (org 3, `ICE_Peru`)  🚧 en curso (2026-08-24)
 
 Primer arranque limpio: `redis-helix-mep` responde (`PING`→`PONG`), `meraki.worker.started`, `drift` en cero. A los ~3 min del arranque, el primer job de `cese` recibió un 429 en el intento 1 (probable resaca del reinicio, el contenedor viejo sin control de concurrencia venía golpeando Meraki justo antes) — el worker reintentó 5 veces respetando `Retry-After` y se recuperó solo en ~1 min; mientras tanto `active` esperó su turno en la cola en vez de disparar en paralelo (justo el comportamiento buscado). Pendiente confirmar que los ciclos siguientes de `cese`/`reconciliation` ya no repiten 429 antes de replicar a las otras 6 organizaciones.
@@ -726,6 +737,25 @@ También se encontró un campo `cursor: string; //number` en `IAlertCisco.ts`, d
 **Pendiente:** validar en el canario que, ante un evento con muchas alertas simultáneas, la paginación multi-página realmente ocurra y traiga todo (difícil de forzar en pruebas -- se valida con observación en producción real y, si se puede, con un ensayo controlado contra una organización con alto volumen).
 
 ---
+
+#### D.5 — `.env` fuera del tracking de git  ✅ (2026-08-24)
+
+**Motivación:** el `.env` estaba trackeado en git desde siempre, con secretos reales (tokens de Meraki, credenciales de GLPI). Además de ser un riesgo de seguridad, complicaba desplegar Fase D en cada organización: cualquier `git pull`/`merge` corría el riesgo de tocar el `.env` real de esa organización.
+
+**Cambio:**
+- `.env` agregado a `.gitignore` y sacado del tracking (`git rm --cached .env` -- el archivo **sigue existiendo en disco tal cual**, solo deja de seguirse en git desde este commit en adelante).
+- `.env.example` nuevo, trackeado, con **todas** las variables que el código realmente usa (barrido completo de `process.env.*` en `src/`), documentadas y sin valores reales.
+- `build/` también agregado a `.gitignore` (quedaba sin ignorar, generaba ruido en `git status` local).
+
+**Importante para desplegar esto en cada organización (taboga, frutera, adifort, acs2, munici-cr, volcano):**
+
+1. **Antes de cualquier `git pull`/`merge`, respaldar el `.env` real de esa carpeta** (`cp .env .env.backup.$(date +%Y%m%d)`) -- por seguridad, aunque `git rm --cached` no debería tocar el archivo en disco.
+2. Al traer este commit, el `.env` local de cada organización queda **desatendido por git pero intacto en disco** -- no hace falta recrearlo.
+3. Para organizaciones **nuevas** de acá en adelante: `git clone <repo> <carpeta-org>`, `cp .env.example .env`, completar valores reales.
+
+**Lo que esto NO resuelve:** los secretos que ya estaban en el historial de git (commits viejos) siguen ahí -- sacar `.env` del tracking de acá en adelante no los borra del historial. Si se quiere purgar el historial completo (ej. con `git filter-repo`/BFG), es una operación aparte, coordinada, que reescribe hashes de commits -- no se hizo en esta fase. Recomendación aparte: rotar `TOKEN_CISCO`/credenciales de GLPI en algún momento, dado que ya estuvieron expuestas en el historial.
+
+**Pendiente (idea del usuario, no implementada aún):** parametrizar `docker-compose.yml` (nombres de servicio/contenedor, puertos) por variable de entorno en vez de hardcodearlos por organización, para que una organización nueva no requiera editar el compose a mano. Queda como mejora de arquitectura para después, fuera de alcance de esta fase.
 
 ## 7. Historial de cambios
 
