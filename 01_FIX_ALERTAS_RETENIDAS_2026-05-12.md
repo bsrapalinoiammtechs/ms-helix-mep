@@ -695,6 +695,36 @@ Primer arranque limpio: `redis-helix-mep` responde (`PING`→`PONG`), `meraki.wo
 
 **Importante:** esas dos variables quedaron **vacías** en el `.env` versionado — no se commitea una credencial real a git (el `.env` de este repo ya está trackeado, con secretos reales; no se corrige ese problema preexistente en esta fase, pero tampoco se agrava). Configurarlas directamente en el host (edición local del `.env` sin commitear, o variable de entorno a nivel de shell/systemd) antes de considerar el dashboard habilitado.
 
+#### D.4 — Paginación de `active`/`cese` no seguía el contrato documentado de Meraki  ✅ (2026-08-24)
+
+**Hallazgo (durante revisión de por qué podrían perderse alertas en ráfagas grandes):** `active.alerts.service.ts` y `cese.alerts.service.ts` (vía `cisco.alerts.service.ts`) construían `startingAfter` **a mano**, tomando el campo `.id` de la última alerta de la página:
+
+```ts
+this.lastAlertId = pageData[pageData.length - 1];
+...
+result = await this.apiMeraki.getAllMerakiAlertsApi(this.lastAlertId?.id);
+```
+
+La [documentación oficial de Meraki](https://developer.cisco.com/meraki/api-v1/get-organization-assurance-alerts/) para este endpoint dice explícitamente lo contrario:
+
+> *"`startingAfter`... This parameter should **not** be defined by client applications. The link for the first, last, prev, or next page in the HTTP `Link` header should define it."*
+
+`reconciliation.service.ts` ya seguía el contrato correcto (`Link: rel=next`) desde la Fase B5; `active`/`cese` no. Con tráfico normal esto nunca se manifestaba porque casi todo cabe en la página 1 (nunca hace falta pedir página 2). El riesgo real: si en un solo ciclo de `active` (1 min) o `cese` (3 min) aparecen **más de `perPage` (300) alertas nuevas/resueltas de golpe** — típicamente durante una caída masiva, justo el peor momento — la paginación hacia páginas 2+ no tenía garantía de funcionar correctamente contra la API real.
+
+También se encontró un campo `cursor: string; //number` en `IAlertCisco.ts`, declarado pero **nunca usado en ningún lado** -- no es el token correcto tampoco (el token de paginación no vive en el body de la alerta, solo en el header `Link` de la respuesta).
+
+**Fix:**
+
+| Archivo | Cambio |
+|---|---|
+| `src/services/cisco.alerts.service.ts` | `getAllMerakiAlertsApi()` ya no recibe `startingAfter`. Mantiene internamente `nextUrl` (extraído de `Link: rel=next`), y expone `hasNextPage()`. Página 1 = URL base + params; páginas siguientes = la URL que Meraki ya armó |
+| `src/services/active.alerts.service.ts` | Quitado `lastAlertId`. `fetchAlerts()` usa `apiMeraki.hasNextPage()`. Además, las ramas de error (status≠200, excepción) antes dejaban `hasMore:true` -- podían reintentar la misma página fallida dentro del mismo ciclo hasta agotar `maxPagesPerCycle` sin avanzar. Ahora cortan (`break:true, hasMore:false`) y el próximo tick del cron retoma limpio, igual que ya hacía `cese` |
+| `src/services/cese.alerts.service.ts` | Mismo cambio de `lastAlertId` → `hasNextPage()`. El manejo de errores ya estaba correcto acá, no se tocó |
+
+`npx tsc --noEmit` limpio. No se tocó `IAlertCisco.ts` (el campo `cursor` sin uso se deja como está, documentado acá para quien lo vea después).
+
+**Pendiente:** validar en el canario que, ante un evento con muchas alertas simultáneas, la paginación multi-página realmente ocurra y traiga todo (difícil de forzar en pruebas -- se valida con observación en producción real y, si se puede, con un ensayo controlado contra una organización con alto volumen).
+
 ---
 
 ## 7. Historial de cambios

@@ -29,7 +29,6 @@ class CeseAlertsService {
     apiMeraki: any;
     timeDelay: number;
     baseDelay: number;
-    lastAlertId: any | null;
     perPageLimit: number;
     organizationId: string;
     organizationName: string;
@@ -41,7 +40,6 @@ class CeseAlertsService {
     constructor() {
         this.timeDelay = parseInt(process.env.CISCO_PAGE_DELAY_MS || "5000", 10);
         this.baseDelay = 5000;
-        this.lastAlertId = null;
         this.perPageLimit = 300;
         this.maxAlertsToProccess = parseInt(process.env.CISCO_MAX_ALERTS || "10000", 10);
         this.maxPagesPerCycle = parseInt(process.env.CISCO_MAX_PAGES || "20", 10);
@@ -221,10 +219,16 @@ class CeseAlertsService {
         } finally {
             CeseAlertsService.isProcessing = false;
             this.alertsProcessedCount = 0;
-            this.lastAlertId = null;
         }
     }
 
+    /**
+     * `hasMore` ya no depende de si la página trajo `id` en el último
+     * elemento -- depende de `apiMeraki.hasNextPage()`, que a su vez viene
+     * de si Meraki devolvió `Link: rel=next` (ver cisco.alerts.service.ts).
+     * El resto de este método ya cortaba el ciclo correctamente ante error
+     * de red o status inesperado; eso se conserva igual.
+     */
     async fetchAlerts() {
       let response:{ hasMore: boolean, timeDelay: number, break: boolean, result:IAlertCisco[]} = {
           hasMore: false,
@@ -233,7 +237,6 @@ class CeseAlertsService {
           result: []
       };
       try {
-        console.log("this.alertsProcessedCount & this.maxAlertsToProccess: ", this.alertsProcessedCount, " &",this.maxAlertsToProccess)
           if (this.alertsProcessedCount >= this.maxAlertsToProccess) {
               return {
                   hasMore: false,
@@ -243,50 +246,31 @@ class CeseAlertsService {
               };
           }
 
-          let result: AxiosResponse<IAlertCisco[]> | null;
-          const alerts: IAlertCisco[] = [];
-              result = await this.apiMeraki.getAllMerakiAlertsApi(this.lastAlertId?.id);
-              if (!result) {
-                  log.warn("cese.fetch.network_error");
-                  return { hasMore: false, timeDelay: 0, break: true, result: [] };
-              }
-               if (result.status === 200) {
-                  const pageData = Array.isArray(result.data) ? result.data : [];
-                  alerts.push(...pageData);
-                  this.alertsProcessedCount += pageData.length;
-                  response.hasMore = true;
-                  this.lastAlertId = pageData[pageData.length - 1];
-                  response.break = false;
-                  response.result = pageData;
-                  response.timeDelay =  this.getRetryDelay(result, 2);
-
-                  if (this.alertsProcessedCount >= this.maxAlertsToProccess) {
-                      response.hasMore = false;
-                      response.break = false;
-                      response.timeDelay = 0;
-                  } else {
-                      const lastAlert = pageData[pageData.length - 1];
-                      if (!lastAlert?.id) {
-                          console.warn("⚠️ [MERAKI API] No se encontró id en la última alerta. Finalizando paginación.");
-                          response.break = true;
-                          response.hasMore = false;
-                          response.timeDelay = 0;
-                          return response;
-                      }
-                  }
-
-                  return response;
-              } else {
-                  // El cliente ya hizo retry interno con backoff respetando Retry-After.
-                  // Llegar aquí significa status inesperado (4xx no-429, 5xx) o 429 con
-                  // budget de retries agotado. Cortar el ciclo y dejar que el próximo
-                  // tick del cron retome desde cero.
-                  log.warn("cese.fetch.unexpected_status", { status: result.status });
-                  response.break = true;
-                  response.hasMore = false;
-                  response.timeDelay = 0;
-                  return response;
-              }
+          const result: AxiosResponse<IAlertCisco[]> | null = await this.apiMeraki.getAllMerakiAlertsApi();
+          if (!result) {
+              log.warn("cese.fetch.network_error");
+              return { hasMore: false, timeDelay: 0, break: true, result: [] };
+          }
+          if (result.status === 200) {
+              const pageData = Array.isArray(result.data) ? result.data : [];
+              this.alertsProcessedCount += pageData.length;
+              response.break = false;
+              response.result = pageData;
+              response.timeDelay = this.getRetryDelay(result, 2);
+              response.hasMore = this.apiMeraki.hasNextPage()
+                  && this.alertsProcessedCount < this.maxAlertsToProccess;
+              return response;
+          } else {
+              // El worker del gateway ya hizo retry interno con backoff respetando
+              // Retry-After. Llegar aquí significa status inesperado (4xx no-429,
+              // 5xx) o 429 con budget de reintentos agotado. Cortar el ciclo y
+              // dejar que el próximo tick del cron retome desde cero.
+              log.warn("cese.fetch.unexpected_status", { status: result.status });
+              response.break = true;
+              response.hasMore = false;
+              response.timeDelay = 0;
+              return response;
+          }
       } catch (e: any) {
                log.error("cese.fetch.exception", { message: e?.message });
                response.hasMore = false;

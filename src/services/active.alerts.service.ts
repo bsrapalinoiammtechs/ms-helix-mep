@@ -28,7 +28,6 @@ class ActiveAlertsService {
     apiMeraki: any;
     timeDelay: number;
     baseDelay: number;
-    lastAlertId: any | null;
     perPageLimit: number;
     organizationId: string;
     organizationName: string;
@@ -40,7 +39,6 @@ class ActiveAlertsService {
     constructor() {
         this.timeDelay = parseInt(process.env.CISCO_PAGE_DELAY_MS || "5000", 10);
         this.baseDelay = 5000;
-        this.lastAlertId = null;
         this.perPageLimit = 300;
         this.maxAlertsToProccess = parseInt(process.env.CISCO_MAX_ALERTS || "10000", 10);
         this.maxPagesPerCycle = parseInt(process.env.CISCO_MAX_PAGES || "20", 10);
@@ -169,9 +167,19 @@ class ActiveAlertsService {
         }
 
         this.alertsProcessedCount = 0;
-        this.lastAlertId = null;
     }
 
+    /**
+     * `hasMore` ya no depende de si la página trajo `id` en el último
+     * elemento -- depende de `apiMeraki.hasNextPage()`, que a su vez viene
+     * de si Meraki devolvió `Link: rel=next` (ver cisco.alerts.service.ts).
+     * Ante error de red o status distinto de 200, se corta el ciclo
+     * (`break:true, hasMore:false`) en vez de reintentar dentro del mismo
+     * ciclo -- el próximo tick del cron (1 min) retoma desde la página 1.
+     * Antes, ambas ramas de error dejaban `hasMore:true`, lo que podía
+     * quedarse reintentando la misma página fallida hasta agotar
+     * `maxPagesPerCycle` sin avanzar.
+     */
     async fetchAlerts() {
         let response:{ hasMore: boolean, timeDelay: number, break: boolean, result:IAlertCisco[]} = {
             hasMore: false,
@@ -188,50 +196,33 @@ class ActiveAlertsService {
                     result: [],
                 };
             }
-            console.log("this.alertsProcessedCount & this.maxAlertsToProccess: ", this.alertsProcessedCount, " &",this.maxAlertsToProccess)
-            let result: AxiosResponse<IAlertCisco[]>;
-            const alerts: IAlertCisco[] = [];
-                result = await this.apiMeraki.getAllMerakiAlertsApi(this.lastAlertId?.id);
-                 if (result.status === 200) {
-                    const pageData = Array.isArray(result.data) ? result.data : [];
-                    alerts.push(...pageData);
-                    this.alertsProcessedCount += pageData.length;
-                    response.hasMore = true;
-                    if (pageData.length > 0) {
-                        this.lastAlertId = pageData[pageData.length - 1];
-                    }
-                    response.break = false;
-                    response.result = pageData;
-                    response.timeDelay =  this.getRetryDelay(result, 2);
-
-                    if (this.alertsProcessedCount >= this.maxAlertsToProccess) {
-                        response.hasMore = false;
-                        response.break = false;
-                        response.timeDelay = 0;
-                    } else {
-                        const lastAlert = pageData[pageData.length - 1];
-                        if (!lastAlert?.id) {
-                            console.warn("⚠️ [MERAKI API] No se encontró id en la última alerta. Finalizando paginación.");
-                            response.break = true;
-                            response.hasMore = false;
-                            response.timeDelay = 0;
-                            return response;
-                        }
-                    }
-
-                    return response;
-                } else {
-                    console.log("ACTIVE = API_MERAKI: Error 429, intentando nuevamente");
-                    response.break = false;
-                    response.hasMore = true;
-                    response.timeDelay =  5000;
-                    return response;
-                }
-        } catch (e) {
-                 response.hasMore = true;
-                 response.break = false;
-                 response.timeDelay =  5000;
-                 return response;
+            const result: AxiosResponse<IAlertCisco[]> | null = await this.apiMeraki.getAllMerakiAlertsApi();
+            if (!result) {
+                log.warn("active.fetch.network_error");
+                return { hasMore: false, timeDelay: 0, break: true, result: [] };
+            }
+            if (result.status === 200) {
+                const pageData = Array.isArray(result.data) ? result.data : [];
+                this.alertsProcessedCount += pageData.length;
+                response.break = false;
+                response.result = pageData;
+                response.timeDelay = this.getRetryDelay(result, 2);
+                response.hasMore = this.apiMeraki.hasNextPage()
+                    && this.alertsProcessedCount < this.maxAlertsToProccess;
+                return response;
+            } else {
+                log.warn("active.fetch.unexpected_status", { status: result.status });
+                response.break = true;
+                response.hasMore = false;
+                response.timeDelay = 0;
+                return response;
+            }
+        } catch (e: any) {
+            log.error("active.fetch.exception", { message: e?.message });
+            response.hasMore = false;
+            response.break = true;
+            response.timeDelay = 0;
+            return response;
         }
     }
 
