@@ -22,6 +22,18 @@ const DEFAULT_RETRY_AFTER_SEC = parseInt(process.env.CISCO_429_DEFAULT_RETRY_SEC
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// El token vive acá, no en job.data -- ver nota en meraki.queue.ts. Se lee
+// una vez al cargar el módulo porque .env no cambia sin reiniciar el
+// contenedor (igual que ya asumían CiscoAlertsService/ReconciliationService).
+const TOKEN_CISCO = process.env.TOKEN_CISCO || "";
+
+function buildAuthHeaders(extra?: Record<string, string>): Record<string, string> {
+  return {
+    ...extra,
+    Authorization: `Bearer ${TOKEN_CISCO}`,
+  };
+}
+
 async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<MerakiHttpResult> {
   const { url, params, headers, timeoutMs } = job.data;
   let attempt = 0;
@@ -30,7 +42,7 @@ async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<Meraki
     let response: AxiosResponse<any>;
     try {
       response = await axios.get(url, {
-        headers,
+        headers: buildAuthHeaders(headers),
         params,
         timeout: timeoutMs ?? 30000,
         validateStatus: () => true,

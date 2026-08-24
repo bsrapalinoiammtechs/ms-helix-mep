@@ -60,7 +60,13 @@ merakiQueueEvents.on("error", (err) => {
 export type MerakiHttpRequest = {
   url: string;
   params?: Record<string, any>;
-  headers: Record<string, string>;
+  // NO incluir aquí el header Authorization: este objeto se persiste tal
+  // cual como job.data en Redis (visible por redis-cli y por cualquier
+  // dashboard de BullMQ que se monte sobre esta cola). El worker arma el
+  // Authorization internamente desde process.env.TOKEN_CISCO -- así el
+  // token de Meraki nunca viaja por Redis. Solo pasar acá headers que NO
+  // sean secretos (hoy, ninguno es necesario).
+  headers?: Record<string, string>;
   timeoutMs?: number;
 };
 

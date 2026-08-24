@@ -34,19 +34,16 @@ class CiscoAlertsService {
     };
   }
 
-  buildHeaders() {
-    return {
-      Authorization: `Bearer ${this.token}`,
-      "Content-Type": "application/json",
-    };
-  }
-
   /**
    * Ya no llama a Meraki directamente: encola la petición en el gateway
    * compartido (`meraki.queue.ts`) y espera su turno. El worker de ese
    * gateway es quien reintenta ante 429 respetando Retry-After -- esta
    * clase ya no necesita su propio loop de reintentos, así queda un solo
    * lugar (`meraki.worker.ts`) que decide cuándo y cómo reintentar.
+   *
+   * No se pasa Authorization acá: el worker arma ese header desde
+   * process.env.TOKEN_CISCO, para que el token nunca quede persistido en
+   * el payload del job en Redis (ver nota en meraki.queue.ts).
    */
   async getAllMerakiAlertsApi(
     startingAfter: any = null,
@@ -56,7 +53,11 @@ class CiscoAlertsService {
       ? { ...this.params, startingAfter }
       : { ...this.params };
 
-    const result = await fetchMerakiPage({ url, params, headers: this.buildHeaders() });
+    const result = await fetchMerakiPage({
+      url,
+      params,
+      headers: { "Content-Type": "application/json" },
+    });
     if (!result) {
       log.error("cisco.fetch.network_error", {});
       return null;

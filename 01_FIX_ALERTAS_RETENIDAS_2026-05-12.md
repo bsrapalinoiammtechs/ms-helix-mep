@@ -679,6 +679,22 @@ axios.get("https://api.meraki.com/api/v1/organizations/846353/assurance/alerts",
 
 **No incluido en esta fase (fuera de alcance, evaluar después):** unificar `CISCO_PAGE_DELAY_MS`/`RECONCILIATION_RATE_DELAY_MS` en una sola variable, y limpiar código muerto (`src/queues/alerts.queues.ts`, `src/workers/alerts.worker.ts`, `src/services/CiscoMerakiAPIService.ts` + `getAndSaveActiveAlerts` en `FlowFunctions.ts`, y los archivos `*copy*`/`*TODAS*`/`*20260324*` sueltos en `src/`) — no afectan el fix actual.
 
+#### D.1 — Validación en canario (org 3, `ICE_Peru`)  🚧 en curso (2026-08-24)
+
+Primer arranque limpio: `redis-helix-mep` responde (`PING`→`PONG`), `meraki.worker.started`, `drift` en cero. A los ~3 min del arranque, el primer job de `cese` recibió un 429 en el intento 1 (probable resaca del reinicio, el contenedor viejo sin control de concurrencia venía golpeando Meraki justo antes) — el worker reintentó 5 veces respetando `Retry-After` y se recuperó solo en ~1 min; mientras tanto `active` esperó su turno en la cola en vez de disparar en paralelo (justo el comportamiento buscado). Pendiente confirmar que los ciclos siguientes de `cese`/`reconciliation` ya no repiten 429 antes de replicar a las otras 6 organizaciones.
+
+#### D.2 — Token de Meraki fuera del payload del job  ✅ (2026-08-24)
+
+**Hallazgo:** `MerakiHttpRequest` (el objeto que se persiste como `job.data` en Redis) incluía el header `Authorization: Bearer <TOKEN_CISCO>` tal cual. Cualquiera con acceso a `redis-cli` en `redis-helix-mep`, o cualquier dashboard de BullMQ montado sobre esa cola, podía leer el token de Meraki de esta organización.
+
+**Fix:** el worker (`meraki.worker.ts`) arma el header `Authorization` internamente desde `process.env.TOKEN_CISCO` (mismo contenedor, mismo `.env`). `cisco.alerts.service.ts` y `reconciliation.service.ts` ya no envían el token al encolar. Jobs creados con el código viejo (antes de este fix) sí quedaron con el token en Redis — se purgan solos vía `removeOnComplete:200`/`removeOnFail:500`, o se puede forzar con `FLUSHDB` en `redis-helix-mep` si se quiere limpiar ya.
+
+#### D.3 — Dashboard `/admin/queues` (bull-board)  ✅ (2026-08-24)
+
+**Nuevo:** `@bull-board/api` + `@bull-board/express` (mismas versiones que ya usa `EpistechWebHook`), montado en `/admin/queues` sobre la cola `meraki-api-calls`. Protegido con basic auth (`src/middleware/basicAuth.ts`) diseñado **fail-closed**: si `BULLBOARD_USER`/`BULLBOARD_PASSWORD` no están configuradas, la ruta responde 503 en vez de quedar abierta.
+
+**Importante:** esas dos variables quedaron **vacías** en el `.env` versionado — no se commitea una credencial real a git (el `.env` de este repo ya está trackeado, con secretos reales; no se corrige ese problema preexistente en esta fase, pero tampoco se agrava). Configurarlas directamente en el host (edición local del `.env` sin commitear, o variable de entorno a nivel de shell/systemd) antes de considerar el dashboard habilitado.
+
 ---
 
 ## 7. Historial de cambios

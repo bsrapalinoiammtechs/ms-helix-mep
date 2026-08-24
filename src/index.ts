@@ -15,6 +15,11 @@ import { log } from "./utils/logger";
 // reconciliation). Debe importarse antes de que los crons de abajo puedan
 // disparar la primera petición.
 import "./workers/meraki.worker";
+import { createBullBoard } from "@bull-board/api";
+import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
+import { ExpressAdapter } from "@bull-board/express";
+import { merakiQueue } from "./queues/meraki.queue";
+import { bullBoardBasicAuth } from "./middleware/basicAuth";
 
 connectDB();
 
@@ -107,6 +112,17 @@ if (reconciliationEnabled) {
 
 const app = express();
 const HTTP_PORT = process.env.HTTP_PORT;
+
+// Dashboard visual de la cola meraki-api-calls (bull-board), protegido con
+// basic auth (ver src/middleware/basicAuth.ts -- "fail closed": queda
+// deshabilitado si no hay BULLBOARD_USER/BULLBOARD_PASSWORD configuradas).
+const bullBoardAdapter = new ExpressAdapter();
+bullBoardAdapter.setBasePath("/admin/queues");
+createBullBoard({
+  queues: [new BullMQAdapter(merakiQueue)],
+  serverAdapter: bullBoardAdapter,
+});
+app.use("/admin/queues", bullBoardBasicAuth, bullBoardAdapter.getRouter());
 
 app.get("/health", async (_req, res) => {
   try {

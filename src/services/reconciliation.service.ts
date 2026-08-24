@@ -263,10 +263,12 @@ class ReconciliationService {
       // llegue hasta acá es un 429 con budget de reintentos agotado (u
       // otro error real) -- se reporta como tal y el próximo ciclo de
       // reconciliación (o el próximo cron) retoma.
+      // No se pasa Authorization acá: el worker lo arma desde
+      // process.env.TOKEN_CISCO (ver nota en meraki.queue.ts) para que el
+      // token no quede persistido en el payload del job en Redis.
       const result = await fetchMerakiPage({
         url: nextUrl || baseUrl,
         params: nextUrl ? undefined : baseParams,
-        headers: { Authorization: `Bearer ${this.token}` },
       });
 
       if (!result) {
