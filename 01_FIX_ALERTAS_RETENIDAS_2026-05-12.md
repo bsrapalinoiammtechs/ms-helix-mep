@@ -776,6 +776,44 @@ Implementada la idea pendiente de D.5: `docker-compose.yml` ya no tiene nombres 
 
 **Pendiente para las 6 organizaciones restantes:** al traer este commit (vía el merge cuidadoso ya en curso), cada organización necesita agregar `ORG_SLUG`/`MONGO_LOCAL_PORT`/`REDIS_LOCAL_PORT` a su `.env` real (valores ya usados hoy: taboga=taboga/27022/‹asignar›, y así con las demás) antes de poder tirar su `docker-compose.yml` personalizado y adoptar este genérico.
 
+#### D.7 — Incidente de datos x2: volumen de Mongo recalculado al parametrizar  ✅ corregido (2026-08-24)
+
+**Qué pasó:** al parametrizar D.6, la clave del volumen de Mongo en el YAML pasó de `mongodb_data_<org>` a `mongodb_data` (genérico). Docker Compose calcula el nombre REAL del volumen como `<carpeta-del-proyecto>_<clave-del-volumen>` -- cambiar la clave (aunque la carpeta sea la misma) da un nombre real distinto, y Docker crea un volumen nuevo vacío sin avisar. Exactamente el mismo mecanismo del incidente de D.1 (ahí fue la carpeta la que cambió, acá fue la clave) -- **le pasó a `taboga`** al desplegar el compose parametrizado (`catalogRules` cayó a 0 otra vez). Se detectó ANTES de aplicarlo a mep3 gracias a chequear `catalogRules` en cada organización antes de darla por buena.
+
+**Recuperado (taboga, sin pérdida real):**
+```bash
+docker volume ls | grep taboga
+# ms-helix-taboga_mongodb_data_taboga     <- de una carpeta aún más vieja, sin tocar
+# ms-helix-taboga_v2_mongodb_data         <- nuevo, vacío (el que quedó en uso)
+# ms-helix-taboga_v2_mongodb_data_taboga  <- real, con los datos de los últimos 3 días
+
+docker compose down
+docker run --rm \
+  -v ms-helix-taboga_v2_mongodb_data_taboga:/from \
+  -v ms-helix-taboga_v2_mongodb_data:/to \
+  alpine sh -c "cp -av /from/. /to/"
+docker compose up -d --build
+# catalogRules volvió a 23
+```
+
+**Fix estructural (para que no vuelva a pasar, ni en mep3 ni en las 5 restantes):** `docker-compose.yml` ahora declara el volumen con `name:` explícito, leído de una variable nueva `MONGO_VOLUME_NAME`:
+
+```yaml
+volumes:
+  mongodb_data:
+    name: ${MONGO_VOLUME_NAME}
+```
+
+Con `name:` fijo, Docker usa exactamente ese nombre sin importar la carpeta o la clave del YAML -- deja de haber cálculo implícito, y por lo tanto deja de haber forma de que un refactor futuro rompa esto por accidente. **Cada organización debe declarar en su `.env` el nombre EXACTO de su volumen real ya existente** (verificado con `docker volume ls`, nunca adivinado):
+
+| Organización | `MONGO_VOLUME_NAME` confirmado |
+|---|---|
+| mep (mep3) | *(pendiente confirmar con `docker volume ls \| grep mep` antes de desplegar -- probablemente `ms-helix-mep3_mongodb_data_mep`, NO asumir sin confirmar)* |
+| taboga | `ms-helix-taboga_v2_mongodb_data` (post-recuperación) |
+| frutera, adifort, acs2, munici-cr, volcano | pendiente, confirmar con `docker volume ls` antes de desplegar cada una |
+
+**Lección para el resto del rollout:** antes de correr `docker compose up -d --build` en CUALQUIER organización con este compose, primero `docker volume ls | grep <org>` y confirmar/setear `MONGO_VOLUME_NAME` con el nombre real. Después del `up`, siempre verificar `curl .../health/types | jq '.catalogRules'` antes de dar la organización por desplegada -- es la señal más rápida de que el volumen correcto está montado.
+
 ## 7. Historial de cambios
 
 | Fecha | Cambio | Quién |

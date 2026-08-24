@@ -21,7 +21,7 @@ services:
     ports:
       - "${MONGO_LOCAL_PORT}:27017" # Para acceder a MongoDB desde tu máquina local
     volumes:
-      - mongodb_data:/data/db
+      - mongodb_data:/data/db # ver bloque `volumes:` al final -- nombre real fijado por MONGO_VOLUME_NAME
     networks:
       - ms-helix-network
 
@@ -62,4 +62,13 @@ networks:
     driver: bridge
 
 volumes:
+  # `name:` explícito a propósito: sin esto, Docker Compose calcula el
+  # nombre real del volumen como <carpeta-del-proyecto>_mongodb_data. Si la
+  # clave de este YAML cambia (como pasó hoy al parametrizar) o la carpeta
+  # cambia (como pasó con el canario de mep), ese cálculo da un nombre
+  # DISTINTO y Docker crea un volumen nuevo vacío -- exactamente los dos
+  # incidentes de datos de hoy (2026-08-24, ver Fase D.1 y D.6 en
+  # 01_FIX_ALERTAS_RETENIDAS...md). Con `name:` fijo, apunta siempre al
+  # volumen real existente sin importar de qué carpeta/clave se despliegue.
   mongodb_data:
+    name: ${MONGO_VOLUME_NAME}
