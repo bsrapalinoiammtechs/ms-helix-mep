@@ -1,8 +1,7 @@
-import axios, { AxiosResponse } from "axios";
+import { AxiosResponse } from "axios";
 import { IAlertCisco } from "../interfaces/IAlertCisco";
+import { fetchMerakiPage } from "../queues/meraki.queue";
 import { log } from "../utils/logger";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type MerakiParams = {
   active: boolean;
@@ -19,8 +18,6 @@ class CiscoAlertsService {
   alertTcpSent: number;
   retry: boolean;
   params: MerakiParams;
-  private readonly maxRetries: number;
-  private readonly defaultRetryAfterSec: number;
 
   constructor({ active, resolved, perPage, sortOrder, sortBy }: MerakiParams) {
     this.orgid =  process.env["ORGANIZATION_ID"] || "";
@@ -35,8 +32,6 @@ class CiscoAlertsService {
       sortOrder,
       ...(sortBy ? { sortBy } : {}),
     };
-    this.maxRetries = parseInt(process.env.CISCO_429_MAX_RETRIES || "5", 10);
-    this.defaultRetryAfterSec = parseInt(process.env.CISCO_429_DEFAULT_RETRY_SEC || "10", 10);
   }
 
   buildHeaders() {
@@ -46,19 +41,13 @@ class CiscoAlertsService {
     };
   }
 
-  async fetchPage(
-    url: string,
-    params: Record<string, any>,
-    headers: Record<string, string>,
-  ): Promise<AxiosResponse<IAlertCisco[]>> {
-    return axios.get<IAlertCisco[]>(url, {
-      headers,
-      params,
-      validateStatus: () => true,
-      timeout: 30000,
-    });
-  }
-
+  /**
+   * Ya no llama a Meraki directamente: encola la petición en el gateway
+   * compartido (`meraki.queue.ts`) y espera su turno. El worker de ese
+   * gateway es quien reintenta ante 429 respetando Retry-After -- esta
+   * clase ya no necesita su propio loop de reintentos, así queda un solo
+   * lugar (`meraki.worker.ts`) que decide cuándo y cómo reintentar.
+   */
   async getAllMerakiAlertsApi(
     startingAfter: any = null,
   ): Promise<AxiosResponse<IAlertCisco[]> | null> {
@@ -67,52 +56,16 @@ class CiscoAlertsService {
       ? { ...this.params, startingAfter }
       : { ...this.params };
 
-    let attempt = 0;
-    for (;;) {
-      let response: AxiosResponse<IAlertCisco[]>;
-      try {
-        response = await this.fetchPage(url, params, this.buildHeaders());
-      } catch (error: any) {
-        log.error("cisco.fetch.network_error", {
-          attempt,
-          message: error?.message,
-        });
-        return null;
-      }
-
-      if (response.status !== 429) {
-        if (attempt > 0) {
-          log.info("cisco.429.recovered", {
-            attempt,
-            status: response.status,
-          });
-        }
-        return response;
-      }
-
-      attempt++;
-      if (attempt > this.maxRetries) {
-        log.warn("cisco.429.exhausted", {
-          attempt,
-          max_retries: this.maxRetries,
-        });
-        return response;
-      }
-
-      const headerVal = response.headers["retry-after"];
-      const parsed = parseInt(String(headerVal ?? this.defaultRetryAfterSec), 10);
-      const retryAfterSec = Number.isFinite(parsed) && parsed >= 0
-        ? parsed
-        : this.defaultRetryAfterSec;
-      const waitMs = (retryAfterSec + 2) * 1000;
-      log.warn("cisco.429.retry", {
-        attempt,
-        max_retries: this.maxRetries,
-        wait_ms: waitMs,
-        retry_after_header: headerVal ?? null,
-      });
-      await sleep(waitMs);
+    const result = await fetchMerakiPage({ url, params, headers: this.buildHeaders() });
+    if (!result) {
+      log.error("cisco.fetch.network_error", {});
+      return null;
     }
+    return {
+      status: result.status,
+      data: result.data,
+      headers: result.headers,
+    } as AxiosResponse<IAlertCisco[]>;
   }
 }
 

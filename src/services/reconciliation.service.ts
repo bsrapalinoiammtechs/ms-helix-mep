@@ -1,6 +1,6 @@
-import axios, { AxiosResponse } from "axios";
 import Alert from "../models/Alert";
 import { recordSync } from "../models/SyncState";
+import { fetchMerakiPage } from "../queues/meraki.queue";
 import { log } from "../utils/logger";
 
 type CiscoResolvedAlert = {
@@ -253,38 +253,40 @@ class ReconciliationService {
     let nextUrl: string | null = null;
 
     while (pages < this.maxPagesPerNetwork) {
-      const response: AxiosResponse<CiscoResolvedAlert[]> = await axios.get(
-        nextUrl || baseUrl,
-        {
-          headers: { Authorization: `Bearer ${this.token}` },
-          params: nextUrl ? undefined : baseParams,
-          validateStatus: () => true,
-          timeout: 30000,
-        },
-      );
+      // Ya no llama a Meraki directamente: encola la petición en el
+      // gateway compartido (`meraki.queue.ts`), el mismo que usan
+      // ActiveAlertsService/CeseAlertsService. Eso es lo que evita que
+      // reconciliation dispare peticiones a Meraki al mismo tiempo que
+      // active/cese -- la causa raíz documentada en la sección 3 del
+      // fix de alertas retenidas. El worker de ese gateway ya reintenta
+      // ante 429 respetando Retry-After, así que un `status !== 200` que
+      // llegue hasta acá es un 429 con budget de reintentos agotado (u
+      // otro error real) -- se reporta como tal y el próximo ciclo de
+      // reconciliación (o el próximo cron) retoma.
+      const result = await fetchMerakiPage({
+        url: nextUrl || baseUrl,
+        params: nextUrl ? undefined : baseParams,
+        headers: { Authorization: `Bearer ${this.token}` },
+      });
 
-      if (response.status === 429) {
-        const retryAfter = parseInt(String(response.headers["retry-after"] || "10"), 10);
-        const waitMs = (Number.isFinite(retryAfter) ? retryAfter + 2 : 12) * 1000;
-        log.warn("reconciliation.rate_limited", {
+      if (!result) {
+        log.warn("reconciliation.network.fetch.network_error", {
           network_id: networkId,
           page: pages + 1,
-          wait_ms: waitMs,
         });
-        await sleep(waitMs);
-        continue;
+        return { resolved: all, pages, exitReason: "network_error" };
       }
 
-      if (response.status !== 200) {
+      if (result.status !== 200) {
         log.warn("reconciliation.unexpected_status", {
           network_id: networkId,
           page: pages + 1,
-          status: response.status,
+          status: result.status,
         });
-        return { resolved: all, pages, exitReason: `status_${response.status}` };
+        return { resolved: all, pages, exitReason: `status_${result.status}` };
       }
 
-      const data = Array.isArray(response.data) ? response.data : [];
+      const data = Array.isArray(result.data) ? result.data : [];
       pages++;
       all.push(...data);
 
@@ -305,7 +307,7 @@ class ReconciliationService {
         return { resolved: all, pages, exitReason: "past_oldest_stuck" };
       }
 
-      const linkHeader = String(response.headers["link"] || "");
+      const linkHeader = String(result.headers["link"] || "");
       const m = linkHeader.match(/<([^>]+)>;\s*rel=next/);
       if (!m) {
         return { resolved: all, pages, exitReason: "no_more_pages" };

@@ -592,6 +592,7 @@ Requiere:
 | B4 — 429 robusto | ✅ **Completada** | 2026-05-12 |
 | B5 — Paginación de la reconciliación | ✅ **Completada** | 2026-05-13 |
 | C — Webhooks Meraki | 📋 Propuesta | — |
+| D — Gateway único BullMQ (concurrencia real active/cese/reconciliation) | 🚧 En rama `release_3.0.1`, pendiente probar y desplegar | 2026-08-24 |
 
 ---
 
@@ -642,6 +643,44 @@ axios.get("https://api.meraki.com/api/v1/organizations/846353/assurance/alerts",
 
 ---
 
+### FASE D — Control de concurrencia real entre active/cese/reconciliation (BullMQ)  🚧 EN RAMA `release_3.0.1` (2026-08-24)
+
+**Origen:** caso abierto por el cliente (Esteban Arce Valerio, MEP) reportando 429 persistentes en producción y correo pidiendo plan/fecha. Análisis técnico enviado el 21-ago (`Informe Tecnico Consumo Meraki API Rate Limiting.docx`) concluyó que la causa es concurrencia de consultas, no caída de la API, y propuso BullMQ como solución definitiva.
+
+**Hallazgo al revisar el código de producción:** `bullmq`/`ioredis` ya estaban en `package.json`, pero `src/queues/alerts.queues.ts` y `src/schedulers/alerts.schedulers.ts` estaban completamente comentados — nunca se cablearon. Lo que corre hoy son **3 `node-cron` independientes** (`active` cada 1 min, `cese` cada 3 min, `reconciliation` cada hora) contra el mismo `ORGANIZATION_ID`, cada uno con su propio delay local entre páginas (5s en active/cese vía `CISCO_PAGE_DELAY_MS`, 11s en reconciliation vía `RECONCILIATION_RATE_DELAY_MS`) y su propio loop de reintento ante 429 — pero **nada impedía que los 3 dispararan peticiones a Meraki al mismo tiempo**. Esa es la causa raíz real de los 429 que sigue reportando el cliente, más allá de la paginación dentro de cada flujo (ya cubierta por B1-B5).
+
+**Fix:** gateway único para toda llamada HTTP a Meraki de esta organización.
+
+| Archivo | Cambio |
+|---|---|
+| `src/config/redis.ts` | **Nuevo** — conexión IORedis (`REDIS_URL`, default `redis://redis-helix-mep:6379`) |
+| `src/queues/meraki.queue.ts` | **Nuevo** — cola `meraki-api-calls` + `fetchMerakiPage()`: encola una petición y espera el resultado vía `job.waitUntilFinished` |
+| `src/workers/meraki.worker.ts` | **Nuevo** — único consumidor. `concurrency:1` + `limiter:{max:1, duration:MERAKI_RATE_DELAY_MS}` (default 11000ms). Reintenta ante 429 respetando `Retry-After` (mismo comportamiento que antes, ahora centralizado acá) |
+| `src/services/cisco.alerts.service.ts` | `getAllMerakiAlertsApi` ya no llama axios directo — encola vía `fetchMerakiPage`. Se quitó su loop de reintento propio (ahora vive en el worker) |
+| `src/services/reconciliation.service.ts` | `fetchResolvedAlertsForNetwork` ya no llama axios directo — encola vía `fetchMerakiPage` |
+| `src/index.ts` | Import de `./workers/meraki.worker` (arranca el worker al boot, antes de que los crons puedan disparar la primera petición) |
+| `docker-compose.yml` | Nuevo servicio `redis-helix-mep` (Redis propio de esta organización, no compartido con las otras 6 ni con Epistech), puerto local `6380:6379`, y `REDIS_URL` en el servicio `ms-helix-mep` |
+| `.env` | Agregadas `REDIS_URL` y `MERAKI_RATE_DELAY_MS=11000` |
+
+`active.alerts.service.ts` y `cese.alerts.service.ts` no se tocaron — siguen llamando a `CiscoAlertsService.getAllMerakiAlertsApi()` igual que antes, el cambio de transporte es interno a esa clase.
+
+**Por qué esto resuelve el problema del cliente:** antes, 3 relojes independientes competían por el mismo presupuesto de rate-limit de Meraki sin coordinarse. Ahora hay un único punto de salida hacia Meraki por organización; sin importar cuál de los 3 flujos pida una página, el worker las sirve una por una con al menos `MERAKI_RATE_DELAY_MS` de separación real. Esto ataca directamente la causa que el informe técnico le atribuyó al cliente ("concurrencia de consultas... por concurrencia de consultas sobre varias organizaciones" — en esta instancia, concurrencia *entre los 3 flujos internos* sobre la misma organización).
+
+**Nota operativa importante:** si `redis-helix-mep` no está disponible o `REDIS_URL` está mal configurado, `fetchMerakiPage` no falla rápido — espera hasta `MERAKI_JOB_WAIT_TIMEOUT_MS` (default 10 min) antes de devolver `null`. Verificar que el contenedor Redis esté arriba y responda (`docker exec redis-helix-mep redis-cli ping`) **antes** de desplegar la nueva imagen de `ms-helix-mep`.
+
+**Pendiente antes de producción:**
+1. `npx tsc --noEmit` ✅ pasa limpio (validado 2026-08-24).
+2. Probar en local/staging contra la org real, confirmando en logs (`meraki.worker.*`) que active/cese/reconciliation ya no producen peticiones simultáneas.
+3. Desplegar primero en **una** de las 7 organizaciones (canario), monitorear `/health` (bloque `drift`) y logs por al menos varias horas.
+4. Si el canario queda limpio, replicar a las 6 organizaciones restantes.
+5. Confirmar con el cliente: cronograma de despliegue + reiterar que "alertas retenidas" ya tiene solución desplegada y monitoreada (Fases A/A.2/B1-B5) — separar ese punto del pedido de 429/concurrencia.
+
+**Rollback:** `git checkout main -- <archivo>` por archivo, o descartar la rama `release_3.0.1` — no se tocó lógica de negocio (parseo de alertas, GLPI, TCP), solo el transporte HTTP hacia Meraki, así que el rollback es de bajo riesgo.
+
+**No incluido en esta fase (fuera de alcance, evaluar después):** unificar `CISCO_PAGE_DELAY_MS`/`RECONCILIATION_RATE_DELAY_MS` en una sola variable, y limpiar código muerto (`src/queues/alerts.queues.ts`, `src/workers/alerts.worker.ts`, `src/services/CiscoMerakiAPIService.ts` + `getAndSaveActiveAlerts` en `FlowFunctions.ts`, y los archivos `*copy*`/`*TODAS*`/`*20260324*` sueltos en `src/`) — no afectan el fix actual.
+
+---
+
 ## 7. Historial de cambios
 
 | Fecha | Cambio | Quién |
@@ -657,3 +696,4 @@ axios.get("https://api.meraki.com/api/v1/organizations/846353/assurance/alerts",
 | 2026-05-13 | B2 revertida: con `sortBy=resolvedAt desc` Cisco devolvía nulls al frente y bloqueaba TODAS las cesaciones. Se vuelve al default de Cisco + filtro defensivo de `resolvedAt:null` | — |
 | 2026-05-13 | Fase B5 completada: `ReconciliationService.fetchResolvedPage` solo leía 1 página → 99% no-found en networks hiperactivas. Reemplazado por `fetchResolvedAlertsForNetwork` con paginación iterativa, corte temprano por relevancia y tope `RECONCILIATION_MAX_PAGES_PER_NETWORK` (8). Validado end-to-end con la alerta `3865777330154712655` (device `SAMEP-02APT007LI4228`) | — |
 | 2026-05-13 | Fase A.2 completada vía opción A (CESE masivo): `updateMany` sobre las 174 alertas >30d con `resolvedAt=now, isTcp=false`. El cron de send despachó 174 CESEs al TCP→NMS (`tcp_success=176, tcp_failed=0`). Drift post: `stuck_1h 462→288`, `oldest_stuck` ahora dentro de los 30d (todas las viejas resueltas). Backup en `host-backup-cese174-20260513-032144/` con los 174 IDs para rollback puntual si hiciera falta | — |
+| 2026-08-24 | Fase D iniciada en rama `release_3.0.1`, en respuesta al caso abierto por el cliente (429 persistentes + pedido de cronograma). Se detectó que BullMQ estaba en `package.json` pero nunca cableado — `active`/`cese`/`reconciliation` corrían como 3 crons independientes sin coordinación entre sí, compitiendo por el mismo rate-limit de Meraki. Se implementó un gateway único (`meraki.queue.ts` + `meraki.worker.ts`, concurrency:1 + limiter 1/`MERAKI_RATE_DELAY_MS`) por el que ahora pasan las 2 rutas reales de llamada a Meraki (`cisco.alerts.service.ts`, `reconciliation.service.ts`). `npx tsc --noEmit` limpio. Pendiente: prueba en staging/canario y despliegue a las 7 organizaciones | — |

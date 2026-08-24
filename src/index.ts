@@ -10,6 +10,11 @@ import Alert from "./models/Alert";
 import AlarmManual from "./models/AlarmManual";
 import { getSyncState } from "./models/SyncState";
 import { log } from "./utils/logger";
+// Side-effect import: arranca el Worker que consume el gateway de llamadas
+// a Meraki (concurrency:1 + rate-limit compartido entre active/cese/
+// reconciliation). Debe importarse antes de que los crons de abajo puedan
+// disparar la primera petición.
+import "./workers/meraki.worker";
 
 connectDB();
 
