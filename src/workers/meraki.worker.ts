@@ -38,6 +38,8 @@ async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<Meraki
   const { url, params, headers, timeoutMs } = job.data;
   let attempt = 0;
 
+  await job.log(`Solicitando ${url}${params ? " (con params, página 1)" : " (URL de página siguiente, ya con params embebidos)"}`);
+
   for (;;) {
     let response: AxiosResponse<any>;
     try {
@@ -48,6 +50,7 @@ async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<Meraki
         validateStatus: () => true,
       });
     } catch (error: any) {
+      await job.log(`Error de red: ${error?.message ?? "sin mensaje"} -- el job queda failed, el próximo ciclo del cron reintenta`);
       log.error("meraki.worker.network_error", {
         jobId: job.id,
         attempt,
@@ -59,6 +62,13 @@ async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<Meraki
     }
 
     if (response.status !== 429) {
+      const count = Array.isArray(response.data) ? response.data.length : undefined;
+      const hasNext = /rel=next/.test(String(response.headers["link"] || ""));
+      await job.log(
+        `Respuesta ${response.status}${attempt > 0 ? ` (recuperado tras ${attempt} reintento(s) de 429)` : ""}` +
+        `${count !== undefined ? ` -- ${count} alertas en esta página` : ""}` +
+        `${hasNext ? ", hay página siguiente (Link: rel=next)" : ", sin página siguiente"}`
+      );
       if (attempt > 0) {
         log.info("meraki.worker.429_recovered", {
           jobId: job.id,
@@ -71,6 +81,7 @@ async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<Meraki
 
     attempt++;
     if (attempt > MAX_RETRIES) {
+      await job.log(`429 agotado: se alcanzó el máximo de ${MAX_RETRIES} reintentos, se devuelve 429 al llamador`);
       log.warn("meraki.worker.429_exhausted", {
         jobId: job.id,
         attempt,
@@ -83,6 +94,7 @@ async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<Meraki
     const parsed = parseInt(String(headerVal ?? DEFAULT_RETRY_AFTER_SEC), 10);
     const retryAfterSec = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_RETRY_AFTER_SEC;
     const waitMs = (retryAfterSec + 2) * 1000;
+    await job.log(`429 recibido (intento ${attempt}/${MAX_RETRIES}, Retry-After: ${headerVal ?? "no enviado, usando default"}) -- esperando ${waitMs}ms antes de reintentar`);
     log.warn("meraki.worker.429_retry", {
       jobId: job.id,
       attempt,
