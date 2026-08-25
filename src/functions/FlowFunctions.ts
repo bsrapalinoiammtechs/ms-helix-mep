@@ -1,3 +1,4 @@
+import { Job } from "bullmq";
 import { IAlert } from "../interfaces/IAlert";
 import { IAlertCisco } from "../interfaces/IAlertCisco";
 import {
@@ -167,15 +168,26 @@ interface IBuiltAlert {
   expectedResolvedAt: string | null;
 }
 
-export const validateAndBuildAlertsToSend = async () => {
+/**
+ * `job` es opcional -- si viene (llamado desde sendAlerts.worker.ts), cada
+ * paso queda registrado en `job.log()` y visible en la pestaña Logs de
+ * bull-board. A diferencia de antes, si algo falla acá el error se
+ * relanza (ya no se traga silenciosamente) para que el job quede marcado
+ * como `failed` en el dashboard -- el caller (el cron en index.ts, o el
+ * worker de BullMQ) sigue teniendo su propio try/catch para loguearlo.
+ */
+export const validateAndBuildAlertsToSend = async (job?: Job) => {
   try {
     const alertsFiltered: IAlert[] = await getPendingAlertsForSend(1000);
     console.log("Cantidad de alertas pendientes: ", alertsFiltered?.length, new Date(Date.now()).toLocaleString('es-CO'));
+    await job?.log(`Alertas pendientes de envío encontradas en Mongo: ${alertsFiltered?.length ?? 0}`);
 
     const built: IBuiltAlert[] = await buildAlertsForHelix(alertsFiltered);
     console.log("Alertas a enviar: ", built.length, new Date(Date.now()).toLocaleString('es-CO'));
+    await job?.log(`Alertas con regla de catálogo, listas para Helix: ${built.length} de ${alertsFiltered.length} pendientes`);
 
     if (built.length === 0) {
+      await job?.log("Nada que enviar en este ciclo -- termina aquí");
       log.info("send.cron.summary", {
         received: alertsFiltered.length,
         built: 0,
@@ -192,6 +204,7 @@ export const validateAndBuildAlertsToSend = async () => {
     const emitAlertsToHelix: { success: number; failed: number } =
       await sendAlertsToTcp(payloads);
     console.log(`Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
+    await job?.log(`Envío a ms-helix-tcp: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`);
 
     let claimed = 0;
     let raceLost = 0;
@@ -206,7 +219,9 @@ export const validateAndBuildAlertsToSend = async () => {
         if (r.status === "fulfilled" && r.value) claimed++;
         else raceLost++;
       }
+      await job?.log(`Marcadas como enviadas en Mongo: ${claimed}${raceLost > 0 ? ` (perdidas por condición de carrera: ${raceLost})` : ""}`);
     } else {
+      await job?.log(`TCP tuvo fallos (${emitAlertsToHelix.failed}) -- no se marca nada como enviado, se reintentará en el próximo ciclo`);
       log.warn("send.cron.tcp_failed.skipping_claim", {
         failed: emitAlertsToHelix.failed,
         success: emitAlertsToHelix.success,
@@ -224,7 +239,9 @@ export const validateAndBuildAlertsToSend = async () => {
     });
   } catch (error) {
     console.log(error);
+    await job?.log(`Error: ${(error as Error)?.message ?? "desconocido"}`);
     log.error("send.cron.error", { message: (error as Error)?.message });
+    throw error;
   }
 };
 

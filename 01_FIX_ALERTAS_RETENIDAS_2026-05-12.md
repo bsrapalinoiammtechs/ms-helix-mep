@@ -814,6 +814,25 @@ Con `name:` fijo, Docker usa exactamente ese nombre sin importar la carpeta o la
 
 **Lección para el resto del rollout:** antes de correr `docker compose up -d --build` en CUALQUIER organización con este compose, primero `docker volume ls | grep <org>` y confirmar/setear `MONGO_VOLUME_NAME` con el nombre real. Después del `up`, siempre verificar `curl .../health/types | jq '.catalogRules'` antes de dar la organización por desplegada -- es la señal más rápida de que el volumen correcto está montado.
 
+#### D.8 — Trazabilidad por job en bull-board  ✅ (2026-08-25)
+
+**Motivación:** la pestaña "Logs" de cada job en bull-board salía vacía -- BullMQ soporta `job.log()` (bitácora propia por job, distinta del logger de consola) pero nunca se usaba.
+
+**D.8.1 — `job.log()` en el worker de Meraki:** `meraki.worker.ts` ahora deja traza paso a paso por job (solicitud, reintentos 429 con Retry-After, resultado final con conteo de alertas y si hay página siguiente). Complementa al logger de consola, no lo reemplaza.
+
+**D.8.2 — Cron de envío a Helix convertido a job trazable:** el cron `send` (cada 1 min, antes llamaba `validateAndBuildAlertsToSend()` directo) ahora encola un job en una cola nueva y separada, `send-alerts-to-helix` (no comparte nada con el gateway de Meraki -- este flujo lee de Mongo y envía por TCP a `ms-helix-tcp`, no llama a Meraki).
+
+| Archivo | Cambio |
+|---|---|
+| `src/queues/sendAlerts.queue.ts` | Nuevo -- cola `send-alerts-to-helix` + `enqueueSendAlertsCycle()` |
+| `src/workers/sendAlerts.worker.ts` | Nuevo -- único consumidor, delega en `validateAndBuildAlertsToSend(job)` |
+| `src/functions/FlowFunctions.ts` | `validateAndBuildAlertsToSend` acepta `job?: Job` opcional, deja bitácora en cada paso (pendientes encontradas, construidas, resultado TCP, marcadas como enviadas). **Cambio de comportamiento:** antes tragaba cualquier error silenciosamente; ahora lo relanza después de loguearlo, para que el job quede `failed` en bull-board -- el cron en `index.ts` ya tenía su propio try/catch (`cron.send.error`), sigue funcionando igual desde afuera |
+| `src/index.ts` | Cron `send` llama `enqueueSendAlertsCycle()` en vez de `validateAndBuildAlertsToSend()` directo. `sendAlertsQueue` agregada al bull-board junto a `meraki-api-calls` |
+
+`npx tsc --noEmit` limpio.
+
+**Pendiente (idea del usuario, no implementada aún):** aplicar el mismo patrón a `reconciliation` (cron cada hora) para tener su propia bitácora por corrida en bull-board.
+
 ## 7. Historial de cambios
 
 | Fecha | Cambio | Quién |

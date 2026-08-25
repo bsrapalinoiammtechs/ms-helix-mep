@@ -5,20 +5,24 @@ import cron from "node-cron";
 import ActiveAlertsService from "./services/active.alerts.service";
 import CeseAlertsService from "./services/cese.alerts.service";
 import ReconciliationService from "./services/reconciliation.service";
-import { validateAndBuildAlertsToSend } from "./functions/FlowFunctions";
 import Alert from "./models/Alert";
 import AlarmManual from "./models/AlarmManual";
 import { getSyncState } from "./models/SyncState";
 import { log } from "./utils/logger";
-// Side-effect import: arranca el Worker que consume el gateway de llamadas
-// a Meraki (concurrency:1 + rate-limit compartido entre active/cese/
-// reconciliation). Debe importarse antes de que los crons de abajo puedan
-// disparar la primera petición.
+// Side-effect imports: arrancan los Workers que consumen cada cola --
+// deben importarse antes de que los crons de abajo puedan encolar el
+// primer job.
+// - meraki.worker: gateway de llamadas a Meraki (concurrency:1 + rate-limit
+//   compartido entre active/cese/reconciliation).
+// - sendAlerts.worker: ciclo de envío de alertas a Helix vía ms-helix-tcp,
+//   ahora trazable como job (antes se llamaba directo desde el cron).
 import "./workers/meraki.worker";
+import "./workers/sendAlerts.worker";
 import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { merakiQueue } from "./queues/meraki.queue";
+import { sendAlertsQueue, enqueueSendAlertsCycle } from "./queues/sendAlerts.queue";
 import { bullBoardBasicAuth } from "./middleware/basicAuth";
 
 connectDB();
@@ -35,7 +39,7 @@ cron.schedule("*/1 * * * *", async () => {
     isProcessingSending = true;
     const t0 = Date.now();
     try {
-      await validateAndBuildAlertsToSend();
+      await enqueueSendAlertsCycle();
       log.info("cron.send.done", { ms: Date.now() - t0 });
     } catch (err: any) {
       log.error("cron.send.error", { ms: Date.now() - t0, message: err?.message });
@@ -119,7 +123,7 @@ const HTTP_PORT = process.env.HTTP_PORT;
 const bullBoardAdapter = new ExpressAdapter();
 bullBoardAdapter.setBasePath("/admin/queues");
 createBullBoard({
-  queues: [new BullMQAdapter(merakiQueue)],
+  queues: [new BullMQAdapter(merakiQueue), new BullMQAdapter(sendAlertsQueue)],
   serverAdapter: bullBoardAdapter,
 });
 app.use("/admin/queues", bullBoardBasicAuth, bullBoardAdapter.getRouter());
