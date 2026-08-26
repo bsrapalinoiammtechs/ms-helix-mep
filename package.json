@@ -5,7 +5,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node --max-old-space-size=10240 build/index.js",
-    "start:prod": "npm run build && npm start"
+    "start:prod": "npm run build && npm start",
+    "backfill:reconciliation": "node build/scripts/backfillReconciliation.js"
   },
   "keywords": [],
   "author": "Andres Rairan",

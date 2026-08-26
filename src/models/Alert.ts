@@ -20,6 +20,12 @@ interface IAlert extends Document {
   isGlpi: boolean;
   isTcp: boolean;
   location: string;
+  // Set solo cuando ReconciliationService cierra la alerta (no cuando la
+  // cierra el flujo normal de CeseAlertsService). Distingue "reconciliation:cron"
+  // (el barrido horario normal) de "reconciliation:backfill" (el script
+  // one-off de Fase E) -- ver 01_FIX_ALERTAS_RETENIDAS...md, sección FASE E.
+  resolvedVia?: string;
+  reconciledAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -79,6 +85,11 @@ const alertSchema = new Schema<IAlert>(
     isGlpi: { type: Boolean, required: true },
     isTcp: { type: Boolean, required: true, default: false },
     location: { type: String, required: false },
+    // Declarados explícitamente -- con `strict` (default de Mongoose) un
+    // campo no declarado en el schema se descarta en silencio en un $set,
+    // igual que pasó antes con `sentAt` (ver 01_FIX_ALERTAS_RETENIDAS...md).
+    resolvedVia: { type: String, required: false },
+    reconciledAt: { type: Date, required: false },
   },
   { timestamps: true } // Habilita `createdAt` y `updatedAt`
 );

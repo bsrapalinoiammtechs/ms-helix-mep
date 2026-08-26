@@ -1,5 +1,6 @@
 import Alert from "../models/Alert";
 import { recordSync } from "../models/SyncState";
+import ReconciliationRun from "../models/ReconciliationRun";
 import { fetchMerakiPage } from "../queues/meraki.queue";
 import { log } from "../utils/logger";
 
@@ -12,6 +13,33 @@ type StuckAlert = {
   alertId: string;
   startedAt: string;
   network?: { id?: string };
+};
+
+export type ReconciliationSummary = {
+  totalStuck: number;
+  inScope: number;
+  outOfScope: number;
+  networksQueried: number;
+  pagesTotal: number;
+  matched: number;
+  updated: number;
+  notFound: number;
+  errors: number;
+  dryRun: boolean;
+  // Alertas que estaban dentro del alcance (in scope) pero que NO aparecieron
+  // en el endpoint de resueltos de Meraki para su red -- o el endpoint ya no
+  // tiene ese resuelto tan viejo (retención), o siguen realmente activas.
+  // Usado por el script de backfill para decidir qué necesita el fallback
+  // por estado de dispositivo (ver 01_FIX_ALERTAS_RETENIDAS, Fase E).
+  notFoundAlerts: Array<{ alertId: string; networkId?: string; startedAt: string }>;
+  // Alertas que SI hicieron match contra el histórico de resueltos de Meraki
+  // (y que en modo real -- no dry-run -- quedaron con resolvedAt actualizado).
+  matchedAlerts: Array<{
+    alertId: string;
+    networkId?: string;
+    startedAt: string;
+    resolvedAt: string;
+  }>;
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -27,32 +55,52 @@ class ReconciliationService {
   private readonly maxNetworks: number;
   private readonly maxPagesPerNetwork: number;
   private readonly dryRun: boolean;
+  private readonly source: string;
 
-  constructor() {
+  constructor(overrides?: {
+    maxAgeDays?: number;
+    rateDelayMs?: number;
+    stuckHours?: number;
+    maxNetworks?: number;
+    maxPagesPerNetwork?: number;
+    dryRun?: boolean;
+    // "cron" (default, corrida horaria normal) o "backfill" (script one-off
+    // de Fase E) -- queda grabado en Alert.resolvedVia y en ReconciliationRun
+    // para poder distinguir en Compass quién cerró cada alerta.
+    source?: string;
+  }) {
     this.orgId = process.env.ORGANIZATION_ID || "";
     this.token = process.env.TOKEN_CISCO || "";
-    this.maxAgeDays = parseInt(process.env.RECONCILIATION_MAX_AGE_DAYS || "30", 10);
-    this.rateDelayMs = parseInt(process.env.RECONCILIATION_RATE_DELAY_MS || "11000", 10);
-    this.stuckHours = parseInt(process.env.RECONCILIATION_STUCK_HOURS || "1", 10);
-    this.maxNetworks = parseInt(process.env.RECONCILIATION_MAX_NETWORKS || "999", 10);
-    this.maxPagesPerNetwork = parseInt(
-      process.env.RECONCILIATION_MAX_PAGES_PER_NETWORK || "8",
-      10,
-    );
-    this.dryRun = process.env.RECONCILIATION_DRY_RUN === "true";
+    this.maxAgeDays =
+      overrides?.maxAgeDays ??
+      parseInt(process.env.RECONCILIATION_MAX_AGE_DAYS || "30", 10);
+    this.rateDelayMs =
+      overrides?.rateDelayMs ??
+      parseInt(process.env.RECONCILIATION_RATE_DELAY_MS || "11000", 10);
+    this.stuckHours =
+      overrides?.stuckHours ??
+      parseInt(process.env.RECONCILIATION_STUCK_HOURS || "1", 10);
+    this.maxNetworks =
+      overrides?.maxNetworks ??
+      parseInt(process.env.RECONCILIATION_MAX_NETWORKS || "999", 10);
+    this.maxPagesPerNetwork =
+      overrides?.maxPagesPerNetwork ??
+      parseInt(process.env.RECONCILIATION_MAX_PAGES_PER_NETWORK || "8", 10);
+    this.dryRun = overrides?.dryRun ?? process.env.RECONCILIATION_DRY_RUN === "true";
+    this.source = overrides?.source ?? "cron";
   }
 
-  async run(): Promise<void> {
+  async run(): Promise<ReconciliationSummary | undefined> {
     if (ReconciliationService.isProcessing) {
       log.info("reconciliation.skip", { reason: "already_running" });
-      return;
+      return undefined;
     }
     if (!this.orgId || !this.token) {
       log.error("reconciliation.config.missing", {
         orgId: Boolean(this.orgId),
         token: Boolean(this.token),
       });
-      return;
+      return undefined;
     }
 
     ReconciliationService.isProcessing = true;
@@ -64,6 +112,8 @@ class ReconciliationService {
     let notFound = 0;
     let errors = 0;
     let pagesTotal = 0;
+    const notFoundAlerts: ReconciliationSummary["notFoundAlerts"] = [];
+    const matchedAlerts: ReconciliationSummary["matchedAlerts"] = [];
 
     try {
       const stuckCutoff = new Date(Date.now() - this.stuckHours * 3600 * 1000).toISOString();
@@ -103,7 +153,34 @@ class ReconciliationService {
             dry_run: this.dryRun,
           },
         });
-        return;
+        await this.persistRun({
+          t0,
+          totalStuck: all.length,
+          inScope: 0,
+          outOfScope,
+          networksQueried: 0,
+          pagesTotal: 0,
+          matched: 0,
+          updated: 0,
+          notFound: 0,
+          errors: 0,
+          matchedAlerts: [],
+          notFoundAlerts: [],
+        });
+        return {
+          totalStuck: all.length,
+          inScope: 0,
+          outOfScope,
+          networksQueried: 0,
+          pagesTotal: 0,
+          matched: 0,
+          updated: 0,
+          notFound: 0,
+          errors: 0,
+          dryRun: this.dryRun,
+          notFoundAlerts: [],
+          matchedAlerts: [],
+        };
       }
 
       const byNetwork = new Map<string, StuckAlert[]>();
@@ -154,15 +231,33 @@ class ReconciliationService {
           const ciscoResolvedAt = resolvedMap.get(a.alertId);
           if (!ciscoResolvedAt) {
             notFound++;
+            notFoundAlerts.push({
+              alertId: a.alertId,
+              networkId: a.network?.id,
+              startedAt: a.startedAt,
+            });
             continue;
           }
           matched++;
           networkMatched++;
+          matchedAlerts.push({
+            alertId: a.alertId,
+            networkId: a.network?.id,
+            startedAt: a.startedAt,
+            resolvedAt: ciscoResolvedAt,
+          });
           if (this.dryRun) continue;
           try {
             const r = await Alert.findOneAndUpdate(
               { alertId: a.alertId, resolvedAt: null },
-              { $set: { resolvedAt: ciscoResolvedAt, isTcp: false } },
+              {
+                $set: {
+                  resolvedAt: ciscoResolvedAt,
+                  isTcp: false,
+                  resolvedVia: `reconciliation:${this.source}`,
+                  reconciledAt: new Date(),
+                },
+              },
               { new: true }
             );
             if (r) updated++;
@@ -215,6 +310,36 @@ class ReconciliationService {
           dry_run: this.dryRun,
         },
       });
+
+      await this.persistRun({
+        t0,
+        totalStuck: all.length,
+        inScope: inScope.length,
+        outOfScope,
+        networksQueried,
+        pagesTotal,
+        matched,
+        updated,
+        notFound,
+        errors,
+        matchedAlerts,
+        notFoundAlerts,
+      });
+
+      return {
+        totalStuck: all.length,
+        inScope: inScope.length,
+        outOfScope,
+        networksQueried,
+        pagesTotal,
+        matched,
+        updated,
+        notFound,
+        errors,
+        dryRun: this.dryRun,
+        notFoundAlerts,
+        matchedAlerts,
+      };
     } catch (e: any) {
       log.error("reconciliation.cycle.error", {
         ms: Date.now() - t0,
@@ -223,8 +348,53 @@ class ReconciliationService {
       await recordSync("cisco_reconciliation", {
         lastError: e?.message ?? "unknown",
       });
+      return undefined;
     } finally {
       ReconciliationService.isProcessing = false;
+    }
+  }
+
+  /**
+   * Deja un documento permanente en `reconciliation_runs` por cada corrida
+   * (cron o backfill, incluido dry-run) -- ver `ReconciliationRun.ts`.
+   * Best-effort: un fallo acá no debe tumbar el ciclo de reconciliación en
+   * sí, solo se loguea.
+   */
+  private async persistRun(args: {
+    t0: number;
+    totalStuck: number;
+    inScope: number;
+    outOfScope: number;
+    networksQueried: number;
+    pagesTotal: number;
+    matched: number;
+    updated: number;
+    notFound: number;
+    errors: number;
+    matchedAlerts: ReconciliationSummary["matchedAlerts"];
+    notFoundAlerts: ReconciliationSummary["notFoundAlerts"];
+  }): Promise<void> {
+    try {
+      await ReconciliationRun.create({
+        runAt: new Date(),
+        source: this.source,
+        dryRun: this.dryRun,
+        maxAgeDays: this.maxAgeDays,
+        totalStuck: args.totalStuck,
+        inScope: args.inScope,
+        outOfScope: args.outOfScope,
+        networksQueried: args.networksQueried,
+        pagesTotal: args.pagesTotal,
+        matched: args.matched,
+        updated: args.updated,
+        notFound: args.notFound,
+        errorCount: args.errors,
+        durationMs: Date.now() - args.t0,
+        matchedAlerts: args.matchedAlerts,
+        notFoundAlerts: args.notFoundAlerts,
+      });
+    } catch (e: any) {
+      log.warn("reconciliation.run_log.error", { message: e?.message });
     }
   }
 
