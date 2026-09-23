@@ -25,6 +25,7 @@ import { IAlertHelix } from "../interfaces/IAlertHelix";
 import { FieldEnum } from "../enums/FieldEnum";
 import { AlertSeverityHelixEnum } from "../enums/AlertSeverityEnum";
 import { sendAlertsToTcp } from "../services/TcpApiService";
+import { enqueueEpistechAlerts } from "../queues/epistechWebhook.queue";
 import CatalogService from "../services/catalog.service";
 import { log } from "../utils/logger";
 import lodash from "lodash";
@@ -205,6 +206,22 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
       await sendAlertsToTcp(payloads);
     console.log(`Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
     await job?.log(`Envío a ms-helix-tcp: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`);
+
+    // Envío en paralelo a EPISTECH (mismo payload, caídas + ceses juntos) --
+    // no bloquea ni condiciona el envío a TCP: si Epistech está caído o
+    // desactivado (EPISTECH_WEBHOOK_ENABLED != "true"), TCP sigue igual.
+    // Encolado, no awaited acá -- lo procesa epistechWebhook.worker.ts.
+    try {
+      const epistechJob = await enqueueEpistechAlerts(payloads);
+      if (epistechJob) {
+        await job?.log(`Encoladas ${payloads.length} alertas para Epistech (job ${epistechJob.id}).`);
+      }
+    } catch (error: any) {
+      // No relanzar: un fallo encolando hacia Epistech no debe tumbar el
+      // ciclo de envío a Helix, que es el canal principal.
+      log.warn("epistech_webhook.enqueue.error", { message: error?.message });
+      await job?.log(`No se pudo encolar el envío a Epistech: ${error?.message}`);
+    }
 
     let claimed = 0;
     let raceLost = 0;

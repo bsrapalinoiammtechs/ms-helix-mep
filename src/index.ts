@@ -18,12 +18,31 @@ import { log } from "./utils/logger";
 //   ahora trazable como job (antes se llamaba directo desde el cron).
 import "./workers/meraki.worker";
 import "./workers/sendAlerts.worker";
+// webhookAlerts.worker: consumidor de alertas ACTIVAS recibidas por push
+// desde Meraki (Fase C, en construcción -- ver 01_FIX_ALERTAS_RETENIDAS...md).
+// Independiente de meraki.worker (ese es el gateway de SALIDA hacia la API
+// REST de Meraki); este consume la cola de ENTRADA que llena la ruta
+// POST /webhooks/meraki/alerts más abajo.
+import "./workers/webhookAlerts.worker";
+// webhookCeses.worker: consumidor de CESES (resolución) recibidos por push
+// -- endpoint separado de webhookAlerts a propósito, ver
+// queues/webhookCeses.queue.ts.
+import "./workers/webhookCeses.worker";
+// epistechWebhook.worker: reenvía caídas + ceses hacia EPISTECH
+// (EpistechWebHook), en paralelo al envío a ms-helix-tcp -- ver
+// FlowFunctions.ts (validateAndBuildAlertsToSend) y
+// queues/epistechWebhook.queue.ts.
+import "./workers/epistechWebhook.worker";
 import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { merakiQueue } from "./queues/meraki.queue";
 import { sendAlertsQueue, enqueueSendAlertsCycle } from "./queues/sendAlerts.queue";
+import { webhookAlertsQueue, enqueueWebhookAlert } from "./queues/webhookAlerts.queue";
+import { webhookCesesQueue, enqueueWebhookCese } from "./queues/webhookCeses.queue";
+import { epistechWebhookQueue } from "./queues/epistechWebhook.queue";
 import { bullBoardBasicAuth } from "./middleware/basicAuth";
+import { merakiWebhookAuth } from "./middleware/merakiWebhookAuth";
 
 connectDB();
 
@@ -48,23 +67,40 @@ cron.schedule("*/1 * * * *", async () => {
     }
 });
 
-cron.schedule("*/1 * * * *", async () => {
-   const t0 = Date.now();
-   try {
-    console.log("---------Active Alerts:----------");
-      if (isProcessingActive) return;
-      isProcessingActive = true;
-    const activeAlertsService: ActiveAlertsService = new ActiveAlertsService();
-    await activeAlertsService.getActiveAlerts();
-    isProcessingActive = false;
-    log.info("cron.active.done", { ms: Date.now() - t0 });
-    } catch (err: any) {
-      log.error("cron.active.error", { ms: Date.now() - t0, message: err?.message });
-    } finally {
-      console.log("### FINALIZADO  ACTIVAS###")
-     }
-});
+// Flags para poder apagar el polling contra Meraki sin parar el contenedor
+// entero -- pensado para desarrollo/pruebas locales (ej. probar el webhook
+// receptor, Fase C) usando credenciales REALES de producción: sin esto,
+// `active`/`cese` seguían corriendo cada 1-3 min contra la Meraki real
+// aunque `RECONCILIATION_ENABLED=false`, compitiendo por el mismo
+// rate-limit que la instancia real de producción (justo lo que la Fase D
+// coordina DENTRO de un proceso, pero no puede coordinar ENTRE procesos
+// distintos). Default `true` en ambos -- no cambia el comportamiento en
+// producción a menos que se seteen explícitamente en `false`.
+const activeEnabled = process.env.ACTIVE_ENABLED !== "false";
+const ceseEnabled = process.env.CESE_ENABLED !== "false";
 
+if (activeEnabled) {
+  cron.schedule("*/1 * * * *", async () => {
+     const t0 = Date.now();
+     try {
+      console.log("---------Active Alerts:----------");
+        if (isProcessingActive) return;
+        isProcessingActive = true;
+      const activeAlertsService: ActiveAlertsService = new ActiveAlertsService();
+      await activeAlertsService.getActiveAlerts();
+      isProcessingActive = false;
+      log.info("cron.active.done", { ms: Date.now() - t0 });
+      } catch (err: any) {
+        log.error("cron.active.error", { ms: Date.now() - t0, message: err?.message });
+      } finally {
+        console.log("### FINALIZADO  ACTIVAS###")
+       }
+  });
+} else {
+  log.info("cron.active.disabled");
+}
+
+if (ceseEnabled) {
 cron.schedule("*/3 * * * *", async () => {
   const t0 = Date.now();
   try {
@@ -81,6 +117,9 @@ cron.schedule("*/3 * * * *", async () => {
       console.log("### FINALIZADO CESES ###")
      }
 });
+} else {
+  log.info("cron.cese.disabled");
+}
 
 // Reconciliación de alertas huérfanas: corre el barrido por network que
 // detecta y cesa las alertas resueltas en Cisco que no llegaron por el cron
@@ -123,10 +162,58 @@ const HTTP_PORT = process.env.HTTP_PORT;
 const bullBoardAdapter = new ExpressAdapter();
 bullBoardAdapter.setBasePath("/admin/queues");
 createBullBoard({
-  queues: [new BullMQAdapter(merakiQueue), new BullMQAdapter(sendAlertsQueue)],
+  queues: [
+    new BullMQAdapter(merakiQueue),
+    new BullMQAdapter(sendAlertsQueue),
+    new BullMQAdapter(webhookAlertsQueue),
+    new BullMQAdapter(webhookCesesQueue),
+    new BullMQAdapter(epistechWebhookQueue),
+  ],
   serverAdapter: bullBoardAdapter,
 });
 app.use("/admin/queues", bullBoardBasicAuth, bullBoardAdapter.getRouter());
+
+// Receptor de Webhooks de Meraki -- Fase C (en construcción). Por ahora
+// solo recibe alertas ACTIVAS (raised); el cese/resolución queda pendiente
+// de decidir si comparte este mismo endpoint o va aparte (ver
+// 01_FIX_ALERTAS_RETENIDAS_2026-05-12.md, sección FASE C). `express.json()`
+// scoped solo a esta ruta -- el resto del servicio no recibe bodies JSON
+// hoy, no hace falta parsearlo globalmente.
+app.post(
+  "/webhooks/meraki/alerts",
+  express.json({ limit: "1mb" }),
+  merakiWebhookAuth,
+  async (req, res) => {
+    try {
+      await enqueueWebhookAlert(req.body);
+      // Responder 2xx rápido es importante: Meraki desactiva el receptor
+      // si la entrega falla consistentemente por más de 100 intentos en
+      // 24h (ver developer.cisco.com/meraki/webhooks/introduction/).
+      res.status(200).json({ status: "queued" });
+    } catch (err: any) {
+      log.error("meraki_webhook.enqueue.error", { message: err?.message });
+      res.status(500).json({ status: "error" });
+    }
+  },
+);
+
+// Endpoint separado para CESES (resolución) -- ver nota en
+// queues/webhookCeses.queue.ts sobre por qué no comparte ruta con el de
+// activas. Mismo shared secret / mismo patrón de respuesta rápida.
+app.post(
+  "/webhooks/meraki/ceses",
+  express.json({ limit: "1mb" }),
+  merakiWebhookAuth,
+  async (req, res) => {
+    try {
+      await enqueueWebhookCese(req.body);
+      res.status(200).json({ status: "queued" });
+    } catch (err: any) {
+      log.error("meraki_webhook.cese.enqueue.error", { message: err?.message });
+      res.status(500).json({ status: "error" });
+    }
+  },
+);
 
 app.get("/health", async (_req, res) => {
   try {
