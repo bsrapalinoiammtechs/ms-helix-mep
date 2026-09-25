@@ -15,6 +15,10 @@ export interface MerakiWebhookAlertPayload {
   sharedSecret?: string;
   sentAt?: string;
   occurredAt?: string;
+  startedAt?: string;
+  dismissedAt?: string | null;
+  resolvedAt?: string | null;
+  expiresAt?: string | null;
   organizationId?: string;
   organizationName?: string;
   organizationUrl?: string;
@@ -24,6 +28,18 @@ export interface MerakiWebhookAlertPayload {
   networkTags?: string[];
   alertId?: string;
   alertType?: string;
+  categoryType?: string;
+  deviceType?: string;
+  title?: string;
+  description?: string | null;
+  severity?: string;
+  cursor?: string;
+  schemaVersion?: string;
+  scope?: {
+    devices?: Record<string, any>[];
+    applications?: Record<string, any>[];
+    peers?: Record<string, any>[];
+  };
   alertData?: Record<string, any>;
   [key: string]: any;
 }

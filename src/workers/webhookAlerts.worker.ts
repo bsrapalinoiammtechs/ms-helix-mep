@@ -8,6 +8,7 @@ import ActiveAlertsService from "../services/active.alerts.service";
 import { saveAlert, handleReactivation } from "../services/MongoDBService";
 import { IAlert } from "../interfaces/IAlert";
 import { log } from "../utils/logger";
+import WebhookTest from "../models/WebhookTest";
 
 /**
  * Consume `meraki-webhook-alerts`: valida contra el catálogo (mismo
@@ -57,6 +58,65 @@ export const webhookAlertsWorker = new Worker(
 
     const productType = alertCisco.scope?.devices?.[0]?.productType ?? "";
     const inCatalog = await CatalogService.hasRule(alertCisco.type, productType);
+
+    // Meraki Toolbox valida la entrega y el renderizado del template, pero
+    // normalmente no representa una alerta Assurance persistida: alertId
+    // llega vacío y los datos del dispositivo pueden estar ausentes. Se
+    // conserva la evidencia de la prueba en una colección separada para no
+    // contaminar `alerts` ni permitir que varios tests hagan upsert sobre
+    // alertId="".
+    if (!alertCisco.id.trim()) {
+      const device = alertCisco.scope?.devices?.[0];
+      const missingFields = [
+        ["alertId", alertCisco.id],
+        ["deviceName", device?.name],
+        ["deviceSerial", device?.serial],
+        ["deviceMac", device?.mac],
+      ]
+        .filter(([, value]) => !String(value ?? "").trim())
+        .map(([field]) => field);
+
+      const test = await WebhookTest.create({
+        source: "meraki_toolbox",
+        queueJobId: String(job.id ?? ""),
+        organizationId: raw.organizationId ?? configuredOrgId,
+        organizationName: raw.organizationName ?? process.env.ORGANIZATION_NAME ?? "",
+        networkId: alertCisco.network?.id ?? "",
+        networkName: alertCisco.network?.name ?? "",
+        alertType: alertCisco.type,
+        productType,
+        categoryType: alertCisco.categoryType,
+        title: alertCisco.title,
+        startedAt: alertCisco.startedAt,
+        catalogMatched: inCatalog,
+        payloadComplete: missingFields.length === 0,
+        missingFields,
+        result: inCatalog ? "catalog_matched" : "not_in_catalog",
+      });
+
+      await job.log(
+        `Prueba Toolbox registrada: testId=${test._id} catalogMatched=${inCatalog} missingFields=${missingFields.join(",") || "none"}`,
+      );
+      log.info("webhook_alerts.toolbox_test", {
+        testId: test._id,
+        networkId: alertCisco.network?.id,
+        type: alertCisco.type,
+        productType,
+        catalogMatched: inCatalog,
+        missingFields,
+      });
+
+      return {
+        test: true,
+        saved: true,
+        testId: String(test._id),
+        catalogMatched: inCatalog,
+        payloadComplete: missingFields.length === 0,
+        missingFields,
+        reason: "toolbox_test_missing_alert_id",
+      };
+    }
+
     if (!inCatalog) {
       await job.log(
         `No está en catálogo (type=${alertCisco.type}, productType=${productType}) -- se descarta.`,

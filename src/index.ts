@@ -7,6 +7,7 @@ import CeseAlertsService from "./services/cese.alerts.service";
 import ReconciliationService from "./services/reconciliation.service";
 import Alert from "./models/Alert";
 import AlarmManual from "./models/AlarmManual";
+import WebhookTest from "./models/WebhookTest";
 import { getSyncState } from "./models/SyncState";
 import { log } from "./utils/logger";
 // Side-effect imports: arrancan los Workers que consumen cada cola --
@@ -172,6 +173,28 @@ createBullBoard({
   serverAdapter: bullBoardAdapter,
 });
 app.use("/admin/queues", bullBoardBasicAuth, bullBoardAdapter.getRouter());
+
+// Historial liviano de pruebas enviadas desde Meraki Toolbox. Usa las
+// mismas credenciales del Bull Dashboard y nunca devuelve el shared secret
+// ni el body completo recibido.
+app.get("/admin/webhook-tests", bullBoardBasicAuth, async (req, res) => {
+  try {
+    const requestedLimit = Number.parseInt(String(req.query.limit ?? "50"), 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 200)
+      : 50;
+
+    const tests = await WebhookTest.find({})
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({ count: tests.length, tests });
+  } catch (err: any) {
+    log.error("webhook_tests.list.error", { message: err?.message });
+    res.status(500).json({ status: "error" });
+  }
+});
 
 // Receptor de Webhooks de Meraki -- Fase C (en construcción). Por ahora
 // solo recibe alertas ACTIVAS (raised); el cese/resolución queda pendiente
