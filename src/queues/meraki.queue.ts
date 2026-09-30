@@ -59,7 +59,13 @@ merakiQueueEvents.on("error", (err) => {
 
 export type MerakiHttpRequest = {
   url: string;
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   params?: Record<string, any>;
+  data?: Record<string, any>;
+  // Permite que el worker agregue `sharedSecret` al body justo antes de
+  // llamar a Meraki. En Redis se persiste solamente el nombre de la
+  // variable, nunca el valor del secreto.
+  sharedSecretEnv?: string;
   // NO incluir aquí el header Authorization: este objeto se persiste tal
   // cual como job.data en Redis (visible por redis-cli y por cualquier
   // dashboard de BullMQ que se monte sobre esta cola). El worker arma el

@@ -46,11 +46,18 @@ webhookAlertsQueueEvents.on("error", (err) => {
  * nuestro formato interno (`IAlertCisco`, vía `mapMerakiWebhookAlert`) pasa
  * DENTRO del Worker (`workers/webhookAlerts.worker.ts`), no acá, para que
  * la ruta HTTP responda a Meraki lo más rápido posible.
+ *
+ * `sharedSecret` se descarta ACÁ antes de encolar -- ya cumplió su
+ * propósito en `merakiWebhookAuth` (corre antes que este handler, valida y
+ * corta con 401 si no coincide). Guardarlo en job.data lo dejaría en texto
+ * plano visible para cualquiera con acceso al dashboard de bull-board
+ * (encontrado en vivo, 29-sep-2026, revisando jobs reales de prueba).
  */
 export async function enqueueWebhookAlert(
   payload: MerakiWebhookAlertPayload,
 ): Promise<Job> {
-  return webhookAlertsQueue.add("raised-alert", payload);
+  const { sharedSecret, ...sanitizedPayload } = payload;
+  return webhookAlertsQueue.add("raised-alert", sanitizedPayload);
 }
 
 export async function closeWebhookAlertsQueue() {

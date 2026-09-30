@@ -8,6 +8,8 @@ import ReconciliationService from "./services/reconciliation.service";
 import Alert from "./models/Alert";
 import AlarmManual from "./models/AlarmManual";
 import WebhookTest from "./models/WebhookTest";
+import WebhookProvisioningRun from "./models/WebhookProvisioningRun";
+import { lookupAlerts } from "./services/alertLookup.service";
 import { getSyncState } from "./models/SyncState";
 import { log } from "./utils/logger";
 // Side-effect imports: arrancan los Workers que consumen cada cola --
@@ -44,6 +46,8 @@ import { webhookCesesQueue, enqueueWebhookCese } from "./queues/webhookCeses.que
 import { epistechWebhookQueue } from "./queues/epistechWebhook.queue";
 import { bullBoardBasicAuth } from "./middleware/basicAuth";
 import { merakiWebhookAuth } from "./middleware/merakiWebhookAuth";
+import MerakiWebhookProvisioningService from "./services/merakiWebhookProvisioning.service";
+import { WebhookProvisioningRequest } from "./interfaces/IMerakiWebhookProvisioning";
 
 connectDB();
 
@@ -195,6 +199,109 @@ app.get("/admin/webhook-tests", bullBoardBasicAuth, async (req, res) => {
     res.status(500).json({ status: "error" });
   }
 });
+
+const webhookProvisioningService = new MerakiWebhookProvisioningService();
+
+app.post(
+  "/admin/meraki/webhook-provisioning/preview",
+  bullBoardBasicAuth,
+  express.json({ limit: "256kb" }),
+  async (req, res) => {
+    try {
+      const preview = await webhookProvisioningService.preview(
+        req.body as WebhookProvisioningRequest,
+      );
+      res.json(preview);
+    } catch (err: any) {
+      log.warn("webhook_provisioning.preview.failed", { message: err?.message });
+      res.status(400).json({ status: "error", message: err?.message });
+    }
+  },
+);
+
+app.post(
+  "/admin/meraki/webhook-provisioning/apply",
+  bullBoardBasicAuth,
+  express.json({ limit: "256kb" }),
+  async (req, res) => {
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({
+        status: "error",
+        message: "apply requiere confirm=true después de revisar preview",
+      });
+    }
+    try {
+      const result = await webhookProvisioningService.apply(
+        req.body as WebhookProvisioningRequest,
+      );
+      return res.json(result);
+    } catch (err: any) {
+      log.error("webhook_provisioning.apply.failed", { message: err?.message });
+      return res.status(400).json({ status: "error", message: err?.message });
+    }
+  },
+);
+
+// Consulta puntual de alertas por id contra Meraki -- para saber si siguen
+// activas, ya se cesaron, o ya no existen ahí (útil para las alertas
+// "no verificadas"/"retenidas" que salen del validador de Helix). Mismo
+// gateway con rate-limit que el resto de la app (ver alertLookup.service.ts).
+// Con muchos ids esto tarda (N * MERAKI_RATE_DELAY_MS) -- subir el timeout
+// del cliente HTTP (Postman) para lotes grandes.
+app.post(
+  "/admin/meraki/alerts/lookup",
+  bullBoardBasicAuth,
+  express.json({ limit: "256kb" }),
+  async (req, res) => {
+    const alertIds = Array.isArray(req.body?.alertIds) ? req.body.alertIds : [];
+    if (!alertIds.length) {
+      return res.status(400).json({ status: "error", message: "alertIds debe ser un array con al menos un id" });
+    }
+    const organizationId = req.body?.organizationId || process.env.ORGANIZATION_ID;
+    if (!organizationId) {
+      return res
+        .status(400)
+        .json({ status: "error", message: "Falta organizationId (o ORGANIZATION_ID en .env)" });
+    }
+    try {
+      const results = await lookupAlerts(organizationId, alertIds);
+      return res.json({
+        organizationId,
+        total: results.length,
+        activa: results.filter((r) => r.estado === "ACTIVA").length,
+        cesada: results.filter((r) => r.estado === "CESADA").length,
+        no_encontrada: results.filter((r) => r.estado === "NO_ENCONTRADA").length,
+        error: results.filter((r) => r.estado === "ERROR").length,
+        results,
+      });
+    } catch (err: any) {
+      log.error("alert_lookup.failed", { message: err?.message });
+      return res.status(500).json({ status: "error", message: err?.message });
+    }
+  },
+);
+
+// Consulta de una corrida de apply() ya persistida (ver
+// models/WebhookProvisioningRun.ts) -- útil sobre todo en rollouts grandes,
+// donde la conexión HTTP original puede cortarse antes de que /apply
+// termine de procesar todos los networks; acá se puede seguir el avance o
+// el resultado final sin depender de esa respuesta.
+app.get(
+  "/admin/meraki/webhook-provisioning/runs/:runId",
+  bullBoardBasicAuth,
+  async (req, res) => {
+    try {
+      const run = await WebhookProvisioningRun.findOne({ runId: req.params.runId }).lean();
+      if (!run) {
+        return res.status(404).json({ status: "error", message: "Corrida no encontrada" });
+      }
+      return res.json(run);
+    } catch (err: any) {
+      log.error("webhook_provisioning.runs.get.failed", { message: err?.message });
+      return res.status(500).json({ status: "error", message: err?.message });
+    }
+  },
+);
 
 // Receptor de Webhooks de Meraki -- Fase C (en construcción). Por ahora
 // solo recibe alertas ACTIVAS (raised); el cese/resolución queda pendiente

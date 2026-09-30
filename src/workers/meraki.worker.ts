@@ -35,17 +35,31 @@ function buildAuthHeaders(extra?: Record<string, string>): Record<string, string
 }
 
 async function processMerakiRequest(job: Job<MerakiHttpRequest>): Promise<MerakiHttpResult> {
-  const { url, params, headers, timeoutMs } = job.data;
+  const { url, method = "GET", params, headers, timeoutMs, sharedSecretEnv } = job.data;
+  const data = { ...(job.data.data ?? {}) };
+  if (sharedSecretEnv) {
+    if (sharedSecretEnv !== "MERAKI_WEBHOOK_SHARED_SECRET") {
+      throw new Error(`Variable de secreto no permitida: ${sharedSecretEnv}`);
+    }
+    const sharedSecret = process.env[sharedSecretEnv];
+    if (!sharedSecret) {
+      throw new Error(`Missing environment variable: ${sharedSecretEnv}`);
+    }
+    data.sharedSecret = sharedSecret;
+  }
   let attempt = 0;
 
-  await job.log(`Solicitando ${url}${params ? " (con params, página 1)" : " (URL de página siguiente, ya con params embebidos)"}`);
+  await job.log(`${method} ${url}${params ? " (con parámetros)" : ""}`);
 
   for (;;) {
     let response: AxiosResponse<any>;
     try {
-      response = await axios.get(url, {
+      response = await axios.request({
+        method,
+        url,
         headers: buildAuthHeaders(headers),
         params,
+        data: method === "GET" || method === "DELETE" ? undefined : data,
         timeout: timeoutMs ?? 30000,
         validateStatus: () => true,
       });

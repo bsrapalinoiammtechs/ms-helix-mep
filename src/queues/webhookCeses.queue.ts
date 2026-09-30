@@ -33,8 +33,13 @@ webhookCesesQueueEvents.on("error", (err) => {
   log.error("webhook_ceses.queue_events.error", { message: err?.message });
 });
 
+// sharedSecret se descarta antes de encolar -- mismo motivo que
+// enqueueWebhookAlert en webhookAlerts.queue.ts (ya se validó en
+// merakiWebhookAuth, guardarlo en job.data lo dejaría visible en texto
+// plano en bull-board).
 export async function enqueueWebhookCese(payload: MerakiWebhookAlertPayload): Promise<Job> {
-  return webhookCesesQueue.add("cese-alert", payload);
+  const { sharedSecret, ...sanitizedPayload } = payload;
+  return webhookCesesQueue.add("cese-alert", sanitizedPayload);
 }
 
 export async function closeWebhookCesesQueue() {
