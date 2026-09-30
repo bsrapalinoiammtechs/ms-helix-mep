@@ -36,6 +36,10 @@ import "./workers/webhookCeses.worker";
 // FlowFunctions.ts (validateAndBuildAlertsToSend) y
 // queues/epistechWebhook.queue.ts.
 import "./workers/epistechWebhook.worker";
+// staleAlertCleanup.worker: limpieza de alertas huérfanas por reemplazo de
+// hardware (RMA) -- puramente local, no llama a Meraki. Ver
+// staleAlertCleanup.service.ts para el caso real que motivó esto.
+import "./workers/staleAlertCleanup.worker";
 import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
@@ -44,6 +48,7 @@ import { sendAlertsQueue, enqueueSendAlertsCycle } from "./queues/sendAlerts.que
 import { webhookAlertsQueue, enqueueWebhookAlert } from "./queues/webhookAlerts.queue";
 import { webhookCesesQueue, enqueueWebhookCese } from "./queues/webhookCeses.queue";
 import { epistechWebhookQueue } from "./queues/epistechWebhook.queue";
+import { staleAlertCleanupQueue, enqueueStaleAlertCleanupCycle } from "./queues/staleAlertCleanup.queue";
 import { bullBoardBasicAuth } from "./middleware/basicAuth";
 import { merakiWebhookAuth } from "./middleware/merakiWebhookAuth";
 import MerakiWebhookProvisioningService from "./services/merakiWebhookProvisioning.service";
@@ -55,6 +60,7 @@ let isProcessingActive = false;
 let isProcessingResolved = false;
 let isProcessingSending = false;
 let isProcessingReconciliation = false;
+let isProcessingStaleCleanup = false;
 
 const startedAt = new Date().toISOString();
 
@@ -158,6 +164,35 @@ if (reconciliationEnabled) {
   log.info("cron.reconciliation.disabled");
 }
 
+// Limpieza de alertas huérfanas por reemplazo de hardware (RMA) -- ver
+// staleAlertCleanup.service.ts. No llama a Meraki, así que puede correr con
+// una cadencia mucho más espaciada que la reconciliación (default cada 6h).
+const staleCleanupSchedule = process.env.STALE_ALERT_CLEANUP_CRON || "30 */6 * * *";
+const staleCleanupEnabled = process.env.STALE_ALERT_CLEANUP_ENABLED !== "false";
+if (staleCleanupEnabled) {
+  if (!cron.validate(staleCleanupSchedule)) {
+    log.error("cron.stale_cleanup.invalid_schedule", { schedule: staleCleanupSchedule });
+  } else {
+    cron.schedule(staleCleanupSchedule, async () => {
+      if (isProcessingStaleCleanup) return;
+      isProcessingStaleCleanup = true;
+      const t0 = Date.now();
+      try {
+        console.log("---------Stale Alert Cleanup:----------");
+        await enqueueStaleAlertCleanupCycle();
+        log.info("cron.stale_cleanup.done", { ms: Date.now() - t0 });
+      } catch (err: any) {
+        log.error("cron.stale_cleanup.error", { ms: Date.now() - t0, message: err?.message });
+      } finally {
+        isProcessingStaleCleanup = false;
+      }
+    });
+    log.info("cron.stale_cleanup.scheduled", { schedule: staleCleanupSchedule });
+  }
+} else {
+  log.info("cron.stale_cleanup.disabled");
+}
+
 const app = express();
 const HTTP_PORT = process.env.HTTP_PORT;
 
@@ -173,6 +208,7 @@ createBullBoard({
     new BullMQAdapter(webhookAlertsQueue),
     new BullMQAdapter(webhookCesesQueue),
     new BullMQAdapter(epistechWebhookQueue),
+    new BullMQAdapter(staleAlertCleanupQueue),
   ],
   serverAdapter: bullBoardAdapter,
 });

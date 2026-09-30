@@ -19,6 +19,27 @@ export interface IReconciliationAlertRef {
   resolvedAt?: string; // solo presente en matchedAlerts
 }
 
+// Resultado de la segunda pasada por lookup individual (ver
+// ReconciliationService.forceResolveStuckAlertsByIdLookup) -- alertas
+// atascadas >RECONCILIATION_FORCE_LOOKUP_STUCK_DAYS (default 2 días) que se
+// verifican una por una contra Meraki (GET assurance/alerts/{id}), no por el
+// escaneo paginado de la red (que puede enterrar alertas viejas). No tiene
+// el límite de 30 días de `maxAgeDays` -- ese límite existe por la
+// paginación, que este camino no usa.
+export interface IReconciliationForceLookup {
+  candidates: number;
+  checked: number;
+  // Meraki confirmó resolvedAt/dismissedAt real -- resolvedVia queda como
+  // "reconciliation:force_lookup:<source>".
+  resolvedCesada: number;
+  // Meraki ya no tiene el id (404) -- se resuelve igual pero con la fecha de
+  // detección (no la real, que no se puede saber), resolvedVia
+  // "reconciliation:force_not_found:<source>".
+  resolvedNotFound: number;
+  stillActive: number;
+  errors: number;
+}
+
 export interface IReconciliationRun extends Document {
   runAt: Date;
   source: string; // "cron" | "backfill"
@@ -38,6 +59,7 @@ export interface IReconciliationRun extends Document {
   durationMs: number;
   matchedAlerts: IReconciliationAlertRef[];
   notFoundAlerts: IReconciliationAlertRef[];
+  forceLookup?: IReconciliationForceLookup;
 }
 
 const alertRefSchema = new Schema<IReconciliationAlertRef>(
@@ -46,6 +68,18 @@ const alertRefSchema = new Schema<IReconciliationAlertRef>(
     networkId: { type: String, required: false },
     startedAt: { type: String, required: true },
     resolvedAt: { type: String, required: false },
+  },
+  { _id: false },
+);
+
+const forceLookupSchema = new Schema<IReconciliationForceLookup>(
+  {
+    candidates: { type: Number, required: true, default: 0 },
+    checked: { type: Number, required: true, default: 0 },
+    resolvedCesada: { type: Number, required: true, default: 0 },
+    resolvedNotFound: { type: Number, required: true, default: 0 },
+    stillActive: { type: Number, required: true, default: 0 },
+    errors: { type: Number, required: true, default: 0 },
   },
   { _id: false },
 );
@@ -68,6 +102,7 @@ const reconciliationRunSchema = new Schema<IReconciliationRun>(
     durationMs: { type: Number, required: true },
     matchedAlerts: { type: [alertRefSchema], default: [] },
     notFoundAlerts: { type: [alertRefSchema], default: [] },
+    forceLookup: { type: forceLookupSchema, required: false },
   },
   { timestamps: true },
 );

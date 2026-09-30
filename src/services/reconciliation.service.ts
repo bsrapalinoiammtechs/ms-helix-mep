@@ -1,7 +1,8 @@
 import Alert from "../models/Alert";
 import { recordSync } from "../models/SyncState";
-import ReconciliationRun from "../models/ReconciliationRun";
+import ReconciliationRun, { IReconciliationForceLookup } from "../models/ReconciliationRun";
 import { fetchMerakiPage } from "../queues/meraki.queue";
+import { lookupAlerts } from "./alertLookup.service";
 import { log } from "../utils/logger";
 
 type CiscoResolvedAlert = {
@@ -40,6 +41,9 @@ export type ReconciliationSummary = {
     startedAt: string;
     resolvedAt: string;
   }>;
+  // Segunda pasada, independiente del escaneo por red de arriba -- ver
+  // forceResolveStuckAlertsByIdLookup().
+  forceLookup: IReconciliationForceLookup;
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -56,6 +60,9 @@ class ReconciliationService {
   private readonly maxPagesPerNetwork: number;
   private readonly dryRun: boolean;
   private readonly source: string;
+  private readonly forceLookupEnabled: boolean;
+  private readonly forceLookupStuckDays: number;
+  private readonly forceLookupMaxPerRun: number;
 
   constructor(overrides?: {
     maxAgeDays?: number;
@@ -68,6 +75,9 @@ class ReconciliationService {
     // de Fase E) -- queda grabado en Alert.resolvedVia y en ReconciliationRun
     // para poder distinguir en Compass quién cerró cada alerta.
     source?: string;
+    forceLookupEnabled?: boolean;
+    forceLookupStuckDays?: number;
+    forceLookupMaxPerRun?: number;
   }) {
     this.orgId = process.env.ORGANIZATION_ID || "";
     this.token = process.env.TOKEN_CISCO || "";
@@ -88,6 +98,19 @@ class ReconciliationService {
       parseInt(process.env.RECONCILIATION_MAX_PAGES_PER_NETWORK || "8", 10);
     this.dryRun = overrides?.dryRun ?? process.env.RECONCILIATION_DRY_RUN === "true";
     this.source = overrides?.source ?? "cron";
+    // Segunda pasada por lookup individual -- independiente del escaneo por
+    // red de arriba, y SIN el límite de maxAgeDays (ese límite existe por la
+    // paginación del endpoint de lista, que este camino no usa: consulta
+    // cada alertId directo contra GET assurance/alerts/{id}).
+    this.forceLookupEnabled =
+      overrides?.forceLookupEnabled ??
+      process.env.RECONCILIATION_FORCE_LOOKUP_ENABLED !== "false";
+    this.forceLookupStuckDays =
+      overrides?.forceLookupStuckDays ??
+      parseInt(process.env.RECONCILIATION_FORCE_LOOKUP_STUCK_DAYS || "2", 10);
+    this.forceLookupMaxPerRun =
+      overrides?.forceLookupMaxPerRun ??
+      parseInt(process.env.RECONCILIATION_FORCE_LOOKUP_MAX_PER_RUN || "100", 10);
   }
 
   async run(): Promise<ReconciliationSummary | undefined> {
@@ -139,6 +162,7 @@ class ReconciliationService {
       });
 
       if (inScope.length === 0) {
+        const forceLookup = await this.forceResolveStuckAlertsByIdLookup();
         log.info("reconciliation.cycle.empty", { ms: Date.now() - t0 });
         await recordSync("cisco_reconciliation", {
           metadata: {
@@ -151,6 +175,7 @@ class ReconciliationService {
             not_found: 0,
             errors: 0,
             dry_run: this.dryRun,
+            force_lookup: forceLookup,
           },
         });
         await this.persistRun({
@@ -166,6 +191,7 @@ class ReconciliationService {
           errors: 0,
           matchedAlerts: [],
           notFoundAlerts: [],
+          forceLookup,
         });
         return {
           totalStuck: all.length,
@@ -180,6 +206,7 @@ class ReconciliationService {
           dryRun: this.dryRun,
           notFoundAlerts: [],
           matchedAlerts: [],
+          forceLookup,
         };
       }
 
@@ -282,6 +309,8 @@ class ReconciliationService {
         if (i < networks.length - 1) await sleep(this.rateDelayMs);
       }
 
+      const forceLookup = await this.forceResolveStuckAlertsByIdLookup();
+
       log.info("reconciliation.cycle.summary", {
         ms: Date.now() - t0,
         total_stuck: all.length,
@@ -294,6 +323,7 @@ class ReconciliationService {
         not_found: notFound,
         errors,
         dry_run: this.dryRun,
+        force_lookup: forceLookup,
       });
 
       await recordSync("cisco_reconciliation", {
@@ -308,6 +338,7 @@ class ReconciliationService {
           not_found: notFound,
           errors,
           dry_run: this.dryRun,
+          force_lookup: forceLookup,
         },
       });
 
@@ -324,6 +355,7 @@ class ReconciliationService {
         errors,
         matchedAlerts,
         notFoundAlerts,
+        forceLookup,
       });
 
       return {
@@ -339,6 +371,7 @@ class ReconciliationService {
         dryRun: this.dryRun,
         notFoundAlerts,
         matchedAlerts,
+        forceLookup,
       };
     } catch (e: any) {
       log.error("reconciliation.cycle.error", {
@@ -373,6 +406,7 @@ class ReconciliationService {
     errors: number;
     matchedAlerts: ReconciliationSummary["matchedAlerts"];
     notFoundAlerts: ReconciliationSummary["notFoundAlerts"];
+    forceLookup: IReconciliationForceLookup;
   }): Promise<void> {
     try {
       await ReconciliationRun.create({
@@ -392,10 +426,130 @@ class ReconciliationService {
         durationMs: Date.now() - args.t0,
         matchedAlerts: args.matchedAlerts,
         notFoundAlerts: args.notFoundAlerts,
+        forceLookup: args.forceLookup,
       });
     } catch (e: any) {
       log.warn("reconciliation.run_log.error", { message: e?.message });
     }
+  }
+
+  /**
+   * Segunda pasada, independiente del escaneo paginado por red de arriba --
+   * verifica una por una (GET assurance/alerts/{id}, vía alertLookup.service,
+   * mismo gateway con rate-limit) las alertas atascadas hace más de
+   * `forceLookupStuckDays` (default 2 días), SIN el límite de 30 días de
+   * `maxAgeDays` -- ese límite existe solo por el riesgo de que la
+   * paginación del endpoint de lista entierre un resuelto viejo; el lookup
+   * individual no tiene ese problema, consulta el id directo.
+   *
+   * Si Meraki confirma que ya está cesada/descartada -> se resuelve con la
+   * fecha real. Si Meraki ya no tiene el id (404, probablemente rotó o
+   * Meraki purgó el historial) -> se resuelve igual, pero con la fecha de
+   * AHORA (no la real, que no se puede saber) y un `resolvedVia` distinto
+   * para dejarlo trazable como inferencia, no confirmación exacta. Si sigue
+   * realmente activa, no se toca -- es una caída real, no un bug de
+   * reconciliación.
+   *
+   * Acotado por `forceLookupMaxPerRun` (default 100) para no disparar
+   * cientos de llamadas de golpe -- si hay más candidatas que eso, el resto
+   * se procesa en las siguientes corridas (se ordena por más viejas primero).
+   */
+  private async forceResolveStuckAlertsByIdLookup(): Promise<IReconciliationForceLookup> {
+    const empty: IReconciliationForceLookup = {
+      candidates: 0,
+      checked: 0,
+      resolvedCesada: 0,
+      resolvedNotFound: 0,
+      stillActive: 0,
+      errors: 0,
+    };
+
+    if (!this.forceLookupEnabled) return empty;
+
+    const cutoff = new Date(
+      Date.now() - this.forceLookupStuckDays * 24 * 3600 * 1000,
+    ).toISOString();
+
+    const candidates = await Alert.find({
+      resolvedAt: null,
+      isGlpi: true,
+      startedAt: { $lt: cutoff },
+    })
+      .sort({ startedAt: 1 })
+      .limit(this.forceLookupMaxPerRun)
+      .lean<StuckAlert[]>();
+
+    if (candidates.length === 0) return empty;
+
+    log.info("reconciliation.force_lookup.start", {
+      candidates: candidates.length,
+      stuck_days: this.forceLookupStuckDays,
+      dry_run: this.dryRun,
+    });
+
+    const results = await lookupAlerts(
+      this.orgId,
+      candidates.map((a) => a.alertId),
+    );
+
+    let resolvedCesada = 0;
+    let resolvedNotFound = 0;
+    let stillActive = 0;
+    let errors = 0;
+
+    for (const r of results) {
+      if (r.estado === "ERROR") {
+        errors++;
+        continue;
+      }
+      if (r.estado === "ACTIVA") {
+        stillActive++;
+        continue;
+      }
+
+      // CESADA o NO_ENCONTRADA -> ya no debe seguir marcada como activa acá.
+      const isCesada = r.estado === "CESADA";
+      const resolvedAt = isCesada && r.resolvedAt ? r.resolvedAt : new Date().toISOString();
+      const resolvedVia = isCesada
+        ? `reconciliation:force_lookup:${this.source}`
+        : `reconciliation:force_not_found:${this.source}`;
+
+      if (this.dryRun) {
+        if (isCesada) resolvedCesada++;
+        else resolvedNotFound++;
+        continue;
+      }
+
+      try {
+        const updated = await Alert.findOneAndUpdate(
+          { alertId: r.alertId, resolvedAt: null },
+          { $set: { resolvedAt, isTcp: false, resolvedVia, reconciledAt: new Date() } },
+          { new: true },
+        );
+        if (updated) {
+          if (isCesada) resolvedCesada++;
+          else resolvedNotFound++;
+        }
+      } catch (e: any) {
+        errors++;
+        log.warn("reconciliation.force_lookup.update.error", {
+          alertId: r.alertId,
+          message: e?.message,
+        });
+      }
+    }
+
+    const summary: IReconciliationForceLookup = {
+      candidates: candidates.length,
+      checked: results.length,
+      resolvedCesada,
+      resolvedNotFound,
+      stillActive,
+      errors,
+    };
+
+    log.info("reconciliation.force_lookup.summary", { ...summary });
+    return summary;
   }
 
   private async fetchResolvedAlertsForNetwork(
