@@ -1,5 +1,6 @@
 import { Job } from "bullmq";
 import Alert from "../models/Alert";
+import { isStaleNetworkName, getStaleNetworkPatterns } from "../utils/staleNetwork";
 import { log } from "../utils/logger";
 
 /**
@@ -27,11 +28,6 @@ import { log } from "../utils/logger";
  * un `resolvedVia` distinto para dejar clara la razón en Compras/auditoría.
  */
 
-const RAW_PATTERNS = process.env.STALE_ALERT_NETWORK_PATTERNS || "PRUEBAS,RMA";
-const NETWORK_PATTERNS = RAW_PATTERNS.split(",")
-  .map((p) => p.trim().toUpperCase())
-  .filter(Boolean);
-
 const MIN_STUCK_DAYS = parseInt(process.env.STALE_ALERT_CLEANUP_MIN_DAYS || "2", 10);
 
 type CandidateAlert = {
@@ -48,14 +44,9 @@ export type StaleAlertCleanupSummary = {
   patterns: string[];
 };
 
-function matchesStaleNetwork(networkName?: string): boolean {
-  if (!networkName) return false;
-  const upper = networkName.toUpperCase();
-  return NETWORK_PATTERNS.some((p) => upper.includes(p));
-}
-
 export async function cleanupStaleNetworkAlerts(job?: Job): Promise<StaleAlertCleanupSummary> {
   const cutoff = new Date(Date.now() - MIN_STUCK_DAYS * 24 * 3600 * 1000).toISOString();
+  const patterns = getStaleNetworkPatterns();
 
   const candidates = await Alert.find({
     resolvedAt: null,
@@ -63,17 +54,17 @@ export async function cleanupStaleNetworkAlerts(job?: Job): Promise<StaleAlertCl
     startedAt: { $lt: cutoff },
   }).lean<CandidateAlert[]>();
 
-  const matches = candidates.filter((a) => matchesStaleNetwork(a.network?.name));
+  const matches = candidates.filter((a) => isStaleNetworkName(a.network?.name));
 
   log.info("stale_alert_cleanup.start", {
     total_candidates: candidates.length,
     matched_by_network_pattern: matches.length,
-    patterns: NETWORK_PATTERNS,
+    patterns,
     min_stuck_days: MIN_STUCK_DAYS,
   });
   await job?.log(
     `Candidatas atascadas >${MIN_STUCK_DAYS}d: ${candidates.length}. ` +
-      `De esas, en red de tránsito (${NETWORK_PATTERNS.join("/")}): ${matches.length}.`,
+      `De esas, en red de tránsito (${patterns.join("/")}): ${matches.length}.`,
   );
 
   let resolved = 0;
@@ -108,7 +99,7 @@ export async function cleanupStaleNetworkAlerts(job?: Job): Promise<StaleAlertCl
     matchedByNetworkPattern: matches.length,
     resolved,
     errors,
-    patterns: NETWORK_PATTERNS,
+    patterns,
   };
 
   log.info("stale_alert_cleanup.summary", { ...summary });

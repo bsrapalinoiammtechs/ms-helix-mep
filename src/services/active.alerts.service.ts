@@ -7,6 +7,7 @@ import { DescriptionEnum } from "../enums/DescriptionEnum";
 import lodash from "lodash";
 import { IAlert } from "../interfaces/IAlert";
 import { saveAlert, setIsTCpAlert, handleReactivation, getExistingActiveAlertIds } from "./MongoDBService";
+import { isStaleNetworkName } from "../utils/staleNetwork";
 import { recordSync } from "../models/SyncState";
 import { IAlertHelix } from "../interfaces/IAlertHelix";
 import { FieldEnum } from "../enums/FieldEnum";
@@ -68,9 +69,34 @@ class ActiveAlertsService {
                 hasMore = result.hasMore;
                 if (result.break) break;
                 pagesScanned++;
-                const pageData = result.result;
-                totalAlertsSeen += pageData.length;
-                if (pageData.length === 0) break;
+                const rawPageData = result.result;
+                totalAlertsSeen += rawPageData.length;
+                if (rawPageData.length === 0) break;
+
+                // Excluye por completo las redes de "estacionamiento"
+                // (RMA/pruebas, ver utils/staleNetwork.ts) -- ni siquiera se
+                // guardan ni se reactivan. Sin esto, cualquier alerta que
+                // staleAlertCleanup.service.ts haya cerrado se revive acá
+                // mismo en <1 minuto: Meraki sigue reportando esos equipos
+                // como activos para siempre (nunca se reconectan de
+                // verdad), así que `saveAlert()` les vuelve a poner
+                // resolvedAt:null en cada ciclo. Hallazgo real 30-sep-2026.
+                const pageData = rawPageData.filter((a) => !isStaleNetworkName(a.network?.name));
+                const staleNetworkSkipped = rawPageData.length - pageData.length;
+
+                if (pageData.length === 0) {
+                    log.info("active.page.scanned", {
+                        page: pagesScanned,
+                        page_size: rawPageData.length,
+                        stale_network_skipped: staleNetworkSkipped,
+                        not_in_catalog: 0,
+                        in_catalog: 0,
+                        already_known: 0,
+                        new: 0,
+                    });
+                    if (hasMore) await this.delay(result.timeDelay);
+                    continue;
+                }
 
                 const ids = pageData.map((a) => a.id);
                 const known = await getExistingActiveAlertIds(ids);
@@ -92,6 +118,7 @@ class ActiveAlertsService {
                 log.info("active.page.scanned", {
                     page: pagesScanned,
                     page_size: pageData.length,
+                    stale_network_skipped: staleNetworkSkipped,
                     not_in_catalog: notInCatalog,
                     in_catalog: inCatalogPage.length,
                     already_known: knownInCatalog,
