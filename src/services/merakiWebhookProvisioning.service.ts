@@ -20,6 +20,8 @@ import {
 } from "../interfaces/IMerakiWebhookProvisioning";
 import { log } from "../utils/logger";
 import WebhookProvisioningRun from "../models/WebhookProvisioningRun";
+import { buildAlertTypesBody, evaluateAlertTypes } from "../utils/alertSettingsPlan";
+import { groupBoundNetworksByTemplate } from "../utils/configTemplateGrouping";
 
 const API_BASE = "https://api.meraki.com/api/v1";
 
@@ -33,6 +35,12 @@ interface MerakiNetwork {
   organizationId: string;
   name: string;
   tags?: string[];
+  isBoundToConfigTemplate?: boolean;
+  configTemplateId?: string;
+  // Solo en las pseudo-redes que representan un Config Template (ver
+  // buildPlans / utils/configTemplateGrouping.ts).
+  isConfigTemplate?: boolean;
+  coveredNetworks?: number;
 }
 
 interface MerakiPayloadTemplate {
@@ -91,6 +99,7 @@ interface ResolvedConfiguration {
   secretSource: string;
   destinationMode: DestinationMode;
   alertTypes: string[];
+  enableAlertTypes: boolean;
 }
 
 // Plan "rico" de uso interno -- carga además el snapshot de alerts/settings
@@ -216,7 +225,11 @@ function resolveVersionedConfiguration(request: WebhookProvisioningRequest): Res
       request.configuration?.secretSource ?? "MERAKI_WEBHOOK_SHARED_SECRET",
     destinationMode: request.configuration?.destinationMode ?? "default",
     alertTypes: request.configuration?.alertTypes ?? [],
+    enableAlertTypes: request.configuration?.enableAlertTypes === true,
   };
+  if (configuration.enableAlertTypes && configuration.destinationMode !== "alertTypes") {
+    throw new Error('configuration.enableAlertTypes solo aplica con destinationMode "alertTypes"');
+  }
   if (configuration.secretSource !== "MERAKI_WEBHOOK_SHARED_SECRET") {
     throw new Error("secretSource solamente puede ser MERAKI_WEBHOOK_SHARED_SECRET");
   }
@@ -338,6 +351,10 @@ async function resolveConfigurationFromReferenceNetwork(
   if (destinationMode === "alertTypes" && !alertTypes.length) {
     throw new Error('configuration.alertTypes es requerido cuando destinationMode es "alertTypes"');
   }
+  const enableAlertTypes = overrides?.enableAlertTypes === true;
+  if (enableAlertTypes && destinationMode !== "alertTypes") {
+    throw new Error('configuration.enableAlertTypes solo aplica con destinationMode "alertTypes"');
+  }
 
   return {
     version: `referenceNetwork:${source.organizationId}/${source.networkId}`,
@@ -349,6 +366,7 @@ async function resolveConfigurationFromReferenceNetwork(
     secretSource,
     destinationMode,
     alertTypes,
+    enableAlertTypes,
   };
 }
 
@@ -480,24 +498,21 @@ function chooseAlertSettingsAction(
   settings: MerakiAlertsSettings,
   receiverId: string | undefined,
   configuration: ResolvedConfiguration,
-): { action: AlertSettingsAction; missingAlertTypes?: string[] } {
+): { action: AlertSettingsAction; missingAlertTypes?: string[]; alertTypesToEnable?: string[] } {
   if (configuration.destinationMode === "alertTypes") {
-    const catalogTypes = new Set((settings.alerts ?? []).map((alert) => alert.type));
-    const missing = configuration.alertTypes.filter((type) => !catalogTypes.has(type));
-    const validTypes = configuration.alertTypes.filter((type) => catalogTypes.has(type));
-    if (!validTypes.length) {
-      return { action: "skipped", missingAlertTypes: missing };
+    const evaluation = evaluateAlertTypes(
+      settings,
+      receiverId,
+      configuration.alertTypes,
+      configuration.enableAlertTypes,
+    );
+    const missingAlertTypes = evaluation.missingTypes.length ? evaluation.missingTypes : undefined;
+    const alertTypesToEnable = evaluation.toEnable.length ? evaluation.toEnable : undefined;
+    if (!evaluation.validTypes.length) {
+      return { action: "skipped", missingAlertTypes: evaluation.missingTypes };
     }
-    if (!receiverId) {
-      return { action: "update", missingAlertTypes: missing.length ? missing : undefined };
-    }
-    const allPresent = (settings.alerts ?? [])
-      .filter((alert) => validTypes.includes(alert.type))
-      .every((alert) => (alert.alertDestinations?.httpServerIds ?? []).includes(receiverId));
-    return {
-      action: allPresent ? "unchanged" : "update",
-      missingAlertTypes: missing.length ? missing : undefined,
-    };
+    // Sin receiver todavía (se crea en apply) nunca puede estar asociado.
+    return { action: evaluation.satisfied ? "unchanged" : "update", missingAlertTypes, alertTypesToEnable };
   }
 
   if (!receiverId) return { action: "update" };
@@ -543,7 +558,11 @@ async function planNetwork(
         ? "unchanged"
         : "update";
   }
-  const { action: alertSettingsAction, missingAlertTypes } = chooseAlertSettingsAction(
+  const {
+    action: alertSettingsAction,
+    missingAlertTypes,
+    alertTypesToEnable,
+  } = chooseAlertSettingsAction(
     currentAlertsSettings,
     receiver?.id,
     configuration,
@@ -559,6 +578,10 @@ async function planNetwork(
     receiverAction,
     alertSettingsAction,
     missingAlertTypes,
+    alertTypesToEnable,
+    ...(network.isConfigTemplate
+      ? { isConfigTemplate: true, coveredNetworks: network.coveredNetworks }
+      : {}),
     payloadTemplateId: template?.payloadTemplateId,
     httpServerId: receiver?.id,
     currentTemplateHash: template
@@ -583,12 +606,35 @@ async function buildPlans(
   const configuration = await resolveConfiguration(request);
   const organizations = await resolveOrganizations(request.organizationSelector);
   const plans: InternalNetworkPlan[] = [];
+  let boundNetworkToTemplate = new Map<string, string>();
 
   for (const organization of organizations) {
     const networks = await getAllPages<MerakiNetwork>(
       `${API_BASE}/organizations/${organization.id}/networks?perPage=1000`,
     );
-    const selected = selectNetworks(networks, request.networkSelector);
+    // Redes vinculadas a un Config Template: Meraki no deja crear receivers
+    // en ellas (400 "Cannot configure webhook urls on a bound network") --
+    // se configuran UNA vez en el template, y las redes lo heredan. Se
+    // reemplazan en el pool por una pseudo-red por template (id = id del
+    // template, que Meraki acepta en las rutas /networks/{id}/webhooks/* y
+    // /alerts/settings). Se pide la lista de templates solo si hace falta.
+    let pool: MerakiNetwork[] = networks;
+    if (networks.some((network) => network.isBoundToConfigTemplate && network.configTemplateId)) {
+      const templates = await getAllPages<{ id: string; name: string }>(
+        `${API_BASE}/organizations/${organization.id}/configTemplates`,
+      );
+      const grouping = groupBoundNetworksByTemplate(
+        networks,
+        new Map(templates.map((template) => [template.id, template.name])),
+        organization.id,
+      );
+      pool = grouping.pool as MerakiNetwork[];
+      if (grouping.unnamedTemplateIds.length) {
+        log.warn("webhook_provisioning.config_template.unnamed", { ids: grouping.unnamedTemplateIds });
+      }
+      boundNetworkToTemplate = new Map([...boundNetworkToTemplate, ...grouping.boundNetworkToTemplate]);
+    }
+    const selected = selectNetworks(pool, request.networkSelector);
     for (const network of selected) {
       plans.push(await planNetwork(organization, network, configuration));
     }
@@ -597,7 +643,16 @@ async function buildPlans(
   if (request.networkSelector.mode === "networkIds") {
     const found = new Set(plans.map((plan) => plan.networkId));
     const missing = request.networkSelector.ids.filter((id) => !found.has(id));
-    if (missing.length) throw new Error(`Networks no encontrados: ${missing.join(", ")}`);
+    if (missing.length) {
+      const bound = missing.filter((id) => boundNetworkToTemplate.has(id));
+      if (bound.length) {
+        throw new Error(
+          `Estas redes están vinculadas a un Config Template y no se configuran por separado -- usar el id del template: ` +
+            bound.map((id) => `${id} -> ${boundNetworkToTemplate.get(id)}`).join(", "),
+        );
+      }
+      throw new Error(`Networks no encontrados: ${missing.join(", ")}`);
+    }
   }
 
   return { configuration, organizationsCount: organizations.length, plans };
@@ -748,33 +803,12 @@ export class MerakiWebhookProvisioningService {
           const current = plan.currentAlertsSettings;
           const body: MerakiAlertsSettings =
             configuration.destinationMode === "alertTypes"
-              ? {
-                  ...current,
-                  // "alertTypes" significa SOLO estos tipos -- si el receiver
-                  // ya estaba en defaultDestinations (p.ej. de un rollout
-                  // previo en modo "default"), hay que sacarlo de ahí o
-                  // seguiría recibiendo TODOS los tipos habilitados además de
-                  // los elegidos acá.
-                  defaultDestinations: {
-                    ...current.defaultDestinations,
-                    httpServerIds: (current.defaultDestinations?.httpServerIds ?? []).filter(
-                      (id) => id !== httpServerId,
-                    ),
-                  },
-                  alerts: (current.alerts ?? []).map((alert) => {
-                    if (!configuration.alertTypes.includes(alert.type)) return alert;
-                    const existingIds = alert.alertDestinations?.httpServerIds ?? [];
-                    return {
-                      ...alert,
-                      alertDestinations: {
-                        ...alert.alertDestinations,
-                        httpServerIds: existingIds.includes(httpServerId!)
-                          ? existingIds
-                          : [...existingIds, httpServerId!],
-                      },
-                    };
-                  }),
-                }
+              ? buildAlertTypesBody(
+                  current,
+                  httpServerId!,
+                  configuration.alertTypes,
+                  configuration.enableAlertTypes,
+                )
               : {
                   ...current,
                   defaultDestinations: {

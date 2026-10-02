@@ -111,7 +111,7 @@ async function main() {
 
   const errorKinds = new Map<string, number>();
   for (const f of failed) {
-    const key = (f.error ?? "sin detalle").replace(/\.\.\.\/networks\/[^/]+/g, "…/networks/<id>").slice(0, 140);
+    const key = (f.error ?? "sin detalle").replace(/\/networks\/[A-Za-z0-9_]+/g, "/networks/<id>").slice(0, 160);
     errorKinds.set(key, (errorKinds.get(key) ?? 0) + 1);
   }
   console.log("Errores de las fallidas (agrupados):");

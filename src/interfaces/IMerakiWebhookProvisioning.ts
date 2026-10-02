@@ -67,6 +67,14 @@ export interface WebhookProvisioningRequest {
     // para forzar algo distinto a lo que ya tiene configurado el modelo.
     destinationMode?: DestinationMode;
     alertTypes?: string[];
+    // Solo con destinationMode "alertTypes". Además de asociar el receiver a
+    // los tipos de alertTypes, los HABILITA (enabled:true) si están apagados
+    // -- necesario en Config Templates en blanco, donde casi ningún tipo está
+    // habilitado y por lo tanto nunca saldría nada por webhook. Los tipos
+    // recién habilitados quedan con destino AISLADO (sin correos, sin SNMP,
+    // allAdmins:false, solo este receiver) para no mandar correo a todos los
+    // administradores; los que ya estaban habilitados conservan sus destinos.
+    enableAlertTypes?: boolean;
   };
 }
 
@@ -96,6 +104,13 @@ export interface WebhookProvisioningNetworkPlan {
   // no existe en el catálogo de este network -- informativo, no bloquea el
   // resto de tipos que sí existan.
   missingAlertTypes?: string[];
+  // Solo con enableAlertTypes: tipos que HOY están deshabilitados y este
+  // apply va a habilitar (con destino aislado).
+  alertTypesToEnable?: string[];
+  // Solo cuando networkId es un Config Template (no una red): las redes
+  // vinculadas heredan su configuración. coveredNetworks = cuántas cubre.
+  isConfigTemplate?: boolean;
+  coveredNetworks?: number;
 }
 
 export interface WebhookProvisioningPreview {

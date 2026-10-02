@@ -25,6 +25,12 @@ export interface IWebhookProvisioningNetworkResult {
   alertSettingsAction: string;
   payloadTemplateId?: string;
   httpServerId?: string;
+  // Solo cuando "networkId" es en realidad un Config Template (redes
+  // vinculadas a template: ver utils/configTemplateGrouping.ts).
+  isConfigTemplate?: boolean;
+  coveredNetworks?: number;
+  // Tipos de alerta que este apply habilitó (enableAlertTypes) -- trazabilidad.
+  alertTypesToEnable?: string[];
   status: string;
   error?: string;
 }
@@ -64,6 +70,9 @@ const networkResultSchema = new Schema<IWebhookProvisioningNetworkResult>(
     alertSettingsAction: { type: String, required: true },
     payloadTemplateId: { type: String, required: false },
     httpServerId: { type: String, required: false },
+    isConfigTemplate: { type: Boolean, required: false },
+    coveredNetworks: { type: Number, required: false },
+    alertTypesToEnable: { type: [String], required: false, default: undefined },
     status: { type: String, required: true },
     error: { type: String, required: false },
   },
