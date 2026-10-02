@@ -202,15 +202,17 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
     }
 
     const payloads: IAlertHelix[] = built.map((b) => b.payload);
-    const emitAlertsToHelix: { success: number; failed: number } =
-      await sendAlertsToTcp(payloads);
-    console.log(`Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
-    await job?.log(`Envío a ms-helix-tcp: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`);
 
-    // Envío en paralelo a EPISTECH (mismo payload, caídas + ceses juntos) --
-    // no bloquea ni condiciona el envío a TCP: si Epistech está caído o
-    // desactivado (EPISTECH_WEBHOOK_ENABLED != "true"), TCP sigue igual.
-    // Encolado, no awaited acá -- lo procesa epistechWebhook.worker.ts.
+    // Envío a EPISTECH (mismo payload, caídas + ceses juntos) -- va ANTES
+    // del envío a TCP a propósito: `sendAlertsToTcp` relanza su error si
+    // ms-helix-tcp está caído, y eso corta esta función; si Epistech se
+    // encolara después, una caída de TCP dejaría también a Epistech sin
+    // recibir nada (los dos canales deben ser independientes).
+    // Contrapartida aceptada: mientras TCP siga fallando, las alertas
+    // siguen pendientes (isTcp:false) y se vuelven a encolar a Epistech en
+    // cada ciclo -- es idempotente de ese lado (upsert por alert_id).
+    // Encolado, no awaited -- lo procesa epistechWebhook.worker.ts. Si
+    // EPISTECH_WEBHOOK_ENABLED != "true" no hace nada.
     try {
       const epistechJob = await enqueueEpistechAlerts(payloads);
       if (epistechJob) {
@@ -222,6 +224,22 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
       log.warn("epistech_webhook.enqueue.error", { message: error?.message });
       await job?.log(`No se pudo encolar el envío a Epistech: ${error?.message}`);
     }
+
+    // TCP_ENABLED=false (default: true) es para instancias que solo deben
+    // alimentar a Epistech y NO tocar Helix (ej. ms-helix-mep-wh): se omite
+    // el envío a ms-helix-tcp y se tratan como entregadas para que se
+    // marquen isTcp:true y no se reintenten cada minuto. NO activar en la
+    // instancia de producción -- ahí las alertas dejarían de llegar a
+    // Helix quedando marcadas como enviadas.
+    const tcpEnabled = process.env.TCP_ENABLED !== "false";
+    const emitAlertsToHelix: { success: number; failed: number } = tcpEnabled
+      ? await sendAlertsToTcp(payloads)
+      : { success: payloads.length, failed: 0 };
+    if (!tcpEnabled) {
+      await job?.log("TCP_ENABLED=false: no se envía a ms-helix-tcp (instancia solo-Epistech).");
+    }
+    console.log(`Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
+    await job?.log(`Envío a ms-helix-tcp: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`);
 
     let claimed = 0;
     let raceLost = 0;
