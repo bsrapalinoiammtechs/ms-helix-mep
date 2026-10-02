@@ -750,6 +750,17 @@ export class MerakiWebhookProvisioningService {
             configuration.destinationMode === "alertTypes"
               ? {
                   ...current,
+                  // "alertTypes" significa SOLO estos tipos -- si el receiver
+                  // ya estaba en defaultDestinations (p.ej. de un rollout
+                  // previo en modo "default"), hay que sacarlo de ahí o
+                  // seguiría recibiendo TODOS los tipos habilitados además de
+                  // los elegidos acá.
+                  defaultDestinations: {
+                    ...current.defaultDestinations,
+                    httpServerIds: (current.defaultDestinations?.httpServerIds ?? []).filter(
+                      (id) => id !== httpServerId,
+                    ),
+                  },
                   alerts: (current.alerts ?? []).map((alert) => {
                     if (!configuration.alertTypes.includes(alert.type)) return alert;
                     const existingIds = alert.alertDestinations?.httpServerIds ?? [];

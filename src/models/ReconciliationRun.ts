@@ -36,6 +36,12 @@ export interface IReconciliationForceLookup {
   // detección (no la real, que no se puede saber), resolvedVia
   // "reconciliation:force_not_found:<source>".
   resolvedNotFound: number;
+  // Meraki confirma "ACTIVA" pero el nombre de red EN VIVO coincide con el
+  // patrón de redes de tránsito (RMA/pruebas) -- el equipo se movió ahí
+  // después de que la alerta se guardó localmente con su red real
+  // original. resolvedVia queda como
+  // "reconciliation:force_lookup_stale_network:<source>".
+  resolvedStaleNetwork: number;
   stillActive: number;
   errors: number;
 }
@@ -78,6 +84,7 @@ const forceLookupSchema = new Schema<IReconciliationForceLookup>(
     checked: { type: Number, required: true, default: 0 },
     resolvedCesada: { type: Number, required: true, default: 0 },
     resolvedNotFound: { type: Number, required: true, default: 0 },
+    resolvedStaleNetwork: { type: Number, required: true, default: 0 },
     stillActive: { type: Number, required: true, default: 0 },
     errors: { type: Number, required: true, default: 0 },
   },

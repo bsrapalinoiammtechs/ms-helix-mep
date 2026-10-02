@@ -3,6 +3,7 @@ import { recordSync } from "../models/SyncState";
 import ReconciliationRun, { IReconciliationForceLookup } from "../models/ReconciliationRun";
 import { fetchMerakiPage } from "../queues/meraki.queue";
 import { lookupAlerts } from "./alertLookup.service";
+import { isStaleNetworkName } from "../utils/staleNetwork";
 import { log } from "../utils/logger";
 
 type CiscoResolvedAlert = {
@@ -460,6 +461,7 @@ class ReconciliationService {
       checked: 0,
       resolvedCesada: 0,
       resolvedNotFound: 0,
+      resolvedStaleNetwork: 0,
       stillActive: 0,
       errors: 0,
     };
@@ -494,6 +496,7 @@ class ReconciliationService {
 
     let resolvedCesada = 0;
     let resolvedNotFound = 0;
+    let resolvedStaleNetwork = 0;
     let stillActive = 0;
     let errors = 0;
 
@@ -502,20 +505,35 @@ class ReconciliationService {
         errors++;
         continue;
       }
-      if (r.estado === "ACTIVA") {
+
+      // El nombre de red viene EN VIVO de Meraki (no de lo guardado
+      // localmente) -- captura el caso donde el equipo se movió físicamente
+      // a una red de tránsito (RMA/pruebas) DESPUÉS de que esta alerta se
+      // guardó con su red real original; nuestra copia local nunca se
+      // entera de ese movimiento por su cuenta. Hallazgo real 30-sep-2026:
+      // SAMEP-02APT044LI4227 -- guardado con red "C.T.P. Pococí", pero
+      // Meraki ya lo reporta en red "RMAs" y sigue "ACTIVA" (el equipo
+      // real está desconectado ahí, no en su red original).
+      const isStaleNetwork = isStaleNetworkName(r.networkName);
+
+      if (r.estado === "ACTIVA" && !isStaleNetwork) {
         stillActive++;
         continue;
       }
 
-      // CESADA o NO_ENCONTRADA -> ya no debe seguir marcada como activa acá.
+      // CESADA, NO_ENCONTRADA, o ACTIVA-pero-en-red-de-tránsito -> ya no
+      // debe seguir marcada como activa acá.
       const isCesada = r.estado === "CESADA";
       const resolvedAt = isCesada && r.resolvedAt ? r.resolvedAt : new Date().toISOString();
       const resolvedVia = isCesada
         ? `reconciliation:force_lookup:${this.source}`
-        : `reconciliation:force_not_found:${this.source}`;
+        : isStaleNetwork
+          ? `reconciliation:force_lookup_stale_network:${this.source}`
+          : `reconciliation:force_not_found:${this.source}`;
 
       if (this.dryRun) {
         if (isCesada) resolvedCesada++;
+        else if (isStaleNetwork) resolvedStaleNetwork++;
         else resolvedNotFound++;
         continue;
       }
@@ -528,6 +546,7 @@ class ReconciliationService {
         );
         if (updated) {
           if (isCesada) resolvedCesada++;
+          else if (isStaleNetwork) resolvedStaleNetwork++;
           else resolvedNotFound++;
         }
       } catch (e: any) {
@@ -544,6 +563,7 @@ class ReconciliationService {
       checked: results.length,
       resolvedCesada,
       resolvedNotFound,
+      resolvedStaleNetwork,
       stillActive,
       errors,
     };

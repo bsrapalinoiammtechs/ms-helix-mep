@@ -9,6 +9,7 @@ import { saveAlert, handleReactivation } from "../services/MongoDBService";
 import { IAlert } from "../interfaces/IAlert";
 import { log } from "../utils/logger";
 import WebhookTest from "../models/WebhookTest";
+import WebhookTypeStat from "../models/WebhookTypeStat";
 
 /**
  * Consume `meraki-webhook-alerts`: valida contra el catálogo (mismo
@@ -58,6 +59,32 @@ export const webhookAlertsWorker = new Worker(
 
     const productType = alertCisco.scope?.devices?.[0]?.productType ?? "";
     const inCatalog = await CatalogService.hasRule(alertCisco.type, productType);
+
+    // Contador por tipo/producto: permite ver qué `alertType` llegan realmente
+    // por webhook (incluidos los descartados por not_in_catalog) sin revisar
+    // job por job en bull-board. Nunca debe romper el procesamiento.
+    if (alertCisco.id.trim()) {
+      try {
+        const now = new Date();
+        await WebhookTypeStat.updateOne(
+          { alertType: alertCisco.type, productType },
+          {
+            $inc: { count: 1 },
+            $set: {
+              inCatalog,
+              lastSeenAt: now,
+              lastNetworkName: alertCisco.network?.name ?? "",
+              lastTitle: alertCisco.title ?? "",
+              lastCategoryType: alertCisco.categoryType ?? "",
+            },
+            $setOnInsert: { firstSeenAt: now },
+          },
+          { upsert: true },
+        );
+      } catch (err: any) {
+        log.warn("webhook_alerts.type_stat_error", { message: err?.message });
+      }
+    }
 
     // Meraki Toolbox valida la entrega y el renderizado del template, pero
     // normalmente no representa una alerta Assurance persistida: alertId
