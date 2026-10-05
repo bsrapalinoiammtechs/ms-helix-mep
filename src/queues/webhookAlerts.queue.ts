@@ -57,7 +57,65 @@ export async function enqueueWebhookAlert(
   payload: MerakiWebhookAlertPayload,
 ): Promise<Job> {
   const { sharedSecret, ...sanitizedPayload } = payload;
-  return webhookAlertsQueue.add("raised-alert", sanitizedPayload);
+  const job = await webhookAlertsQueue.add("raised-alert", sanitizedPayload);
+  await scheduleNetworkVerification(sanitizedPayload);
+  return job;
+}
+
+/**
+ * Verificación por red disparada por webhook: un `stopped_reporting` es solo
+ * el aviso de que algo se cayó en esa red -- no trae equipo ni el id de la
+ * alerta de Assurance, y la mitad son parpadeos que Assurance nunca eleva
+ * (medido 5-oct-2026: producción solo registra caídas de 15 min o más). Se
+ * agenda una consulta a la API de Meraki pasado ese umbral, para que Assurance
+ * decida qué es alerta real y traiga el detalle por equipo y el id real.
+ *
+ * Desactivado por defecto: solo `-wh` lo activa con
+ * WEBHOOK_VERIFY_ENABLED=true. La consulta real y su agrupación por red viven
+ * en `workers/webhookAlerts.worker.ts` (processNetworkVerification).
+ */
+export const VERIFY_NETWORK_JOB_NAME = "verify-network";
+
+const VERIFY_ENABLED = process.env.WEBHOOK_VERIFY_ENABLED === "true";
+const VERIFY_DELAY_MS = parseInt(
+  process.env.WEBHOOK_VERIFY_DELAY_MS || String(15 * 60 * 1000),
+  10,
+);
+
+export interface VerifyNetworkJobData {
+  networkId: string;
+  networkName: string;
+  organizationId: string;
+  eventAt: string;
+}
+
+async function scheduleNetworkVerification(payload: MerakiWebhookAlertPayload) {
+  if (!VERIFY_ENABLED || payload.alertType !== "stopped_reporting" || !payload.networkId) {
+    return;
+  }
+  // Un fallo acá no debe devolver 500 a Meraki: reintentaría el mismo
+  // payload y duplicaría el aviso. El polling sigue cubriendo la alerta.
+  try {
+    const data: VerifyNetworkJobData = {
+      networkId: payload.networkId,
+      networkName: payload.networkName ?? "",
+      organizationId: payload.organizationId ?? "",
+      eventAt: payload.startedAt ?? payload.sentAt ?? new Date().toISOString(),
+    };
+    // Un job por evento, sin jobId: cada caída se verifica 15 min DESPUÉS de
+    // su propio aviso. La agrupación (una sola consulta cuando 10 APs de la
+    // misma sede caen juntos) se hace al ejecutar, con un candado por red.
+    await webhookAlertsQueue.add(VERIFY_NETWORK_JOB_NAME, data, {
+      delay: VERIFY_DELAY_MS,
+      removeOnComplete: 100,
+      removeOnFail: 100,
+    });
+  } catch (err: any) {
+    log.warn("webhook_verify.schedule_failed", {
+      networkId: payload.networkId,
+      message: err?.message,
+    });
+  }
 }
 
 export async function closeWebhookAlertsQueue() {

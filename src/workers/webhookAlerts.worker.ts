@@ -1,6 +1,11 @@
 import { Worker, Job } from "bullmq";
 import { redisConnection } from "../config/redis";
-import { WEBHOOK_ALERTS_QUEUE_NAME } from "../queues/webhookAlerts.queue";
+import {
+  WEBHOOK_ALERTS_QUEUE_NAME,
+  VERIFY_NETWORK_JOB_NAME,
+  VerifyNetworkJobData,
+} from "../queues/webhookAlerts.queue";
+import { fetchMerakiPage } from "../queues/meraki.queue";
 import { MerakiWebhookAlertPayload } from "../interfaces/IMerakiWebhookAlert";
 import { mapMerakiWebhookAlert } from "../functions/mapMerakiWebhookAlert";
 import CatalogService from "../services/catalog.service";
@@ -30,9 +35,62 @@ const CONCURRENCY = parseInt(process.env.WEBHOOK_ALERTS_CONCURRENCY || "3", 10);
 // ningún cron ni fetch de Meraki por sí sola.
 const glpiValidator = new ActiveAlertsService();
 
+// Ventana en la que varios avisos de la misma red comparten una sola consulta
+// a la API: cuando 10 APs de una sede caen juntos llegan 10 webhooks, pero
+// basta una consulta de alertas activas de esa red para traerlos todos.
+const VERIFY_COALESCE_S = Math.ceil(
+  parseInt(process.env.WEBHOOK_VERIFY_COALESCE_MS || String(5 * 60 * 1000), 10) / 1000,
+);
+
+/**
+ * Pasado el umbral desde un `stopped_reporting`, pide a Meraki las alertas
+ * activas de esa red (una sola llamada, por el gateway con rate-limit de
+ * meraki.queue.ts -- nunca directo, para no sumar 429) y guarda las que ya
+ * levantó Assurance con el mismo flujo del polling. Si era un parpadeo, la
+ * API no devuelve nada y no se guarda nada.
+ */
+async function processNetworkVerification(job: Job<VerifyNetworkJobData>) {
+  const { networkId, networkName, eventAt } = job.data;
+  const orgId = process.env.ORGANIZATION_ID || job.data.organizationId;
+  const lockKey = `webhook_verify:lock:${networkId}`;
+
+  const acquired = await redisConnection.set(lockKey, "1", "EX", VERIFY_COALESCE_S, "NX");
+  if (!acquired) {
+    await job.log(`Red ${networkId} ya verificada hace menos de ${VERIFY_COALESCE_S}s -- se agrupa con esa consulta.`);
+    return { skipped: true, reason: "recently_verified" };
+  }
+
+  try {
+    const result = await fetchMerakiPage(
+      {
+        url: `https://api.meraki.com/api/v1/organizations/${orgId}/assurance/alerts`,
+        method: "GET",
+        params: { networkId, active: true, perPage: 100 },
+      },
+      "webhook-verify",
+    );
+    if (!result || result.status !== 200) {
+      // Se libera el candado para que el reintento de BullMQ sí consulte.
+      throw new Error(`Meraki no respondió 200 (status=${result?.status ?? "sin respuesta"})`);
+    }
+
+    const alerts = Array.isArray(result.data) ? result.data : [];
+    const summary = await glpiValidator.ingestActiveAlerts(alerts);
+    await job.log(`Verificación de ${networkName || networkId} (aviso ${eventAt}): ${JSON.stringify(summary)}`);
+    log.info("webhook_verify.processed", { networkId, eventAt, ...summary });
+    return { verified: true, ...summary };
+  } catch (err) {
+    await redisConnection.del(lockKey);
+    throw err;
+  }
+}
+
 export const webhookAlertsWorker = new Worker(
   WEBHOOK_ALERTS_QUEUE_NAME,
   async (job: Job<MerakiWebhookAlertPayload>) => {
+    if (job.name === VERIFY_NETWORK_JOB_NAME) {
+      return processNetworkVerification(job as unknown as Job<VerifyNetworkJobData>);
+    }
     const raw = job.data;
     await job.log(
       `Webhook recibido: alertId=${raw.alertId} alertType=${raw.alertType} networkId=${raw.networkId}`,

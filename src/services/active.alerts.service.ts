@@ -133,38 +133,7 @@ class ActiveAlertsService {
 
                 totalNew += newOrChanged.length;
                 const validateAlerts = await this.validateAlertsWithGlpi(newOrChanged);
-                const savePromises = validateAlerts.map(
-                     async (alertValidate: IAlertCiscoGlpi) => {
-                       const alertToSave: IAlert = {
-                         alertId: alertValidate.id,
-                         organization: {
-                           id: this.organizationId,
-                           name: this.organizationName,
-                         },
-                         categoryType: alertValidate.categoryType,
-                         network: alertValidate.network,
-                         startedAt: alertValidate.startedAt,
-                         dismissedAt: alertValidate.dismissedAt,
-                         resolvedAt: alertValidate.resolvedAt,
-                         deviceType: alertValidate.deviceType,
-                         type: alertValidate.type,
-                         title: alertValidate.title,
-                         description: alertValidate.description || "",
-                         severity: alertValidate.severity,
-                         scope: alertValidate.scope,
-                         descriptionGlpi: alertValidate.descriptionGlpi,
-                         isGlpi: alertValidate.isGlpi,
-                         comment: alertValidate.comment || "",
-                         isTcp: false,
-                         location: alertValidate.location,
-                       };
-                       await saveAlert(alertToSave);
-                       if (alertToSave.resolvedAt === null || alertToSave.resolvedAt === undefined) {
-                         await handleReactivation(alertToSave.alertId, alertToSave.startedAt);
-                       }
-                     }
-                   );
-                await Promise.all(savePromises);
+                await this.persistValidatedAlerts(validateAlerts);
                 if (hasMore) await this.delay(result.timeDelay);
             }
 
@@ -194,6 +163,68 @@ class ActiveAlertsService {
         }
 
         this.alertsProcessedCount = 0;
+    }
+
+    /**
+     * Guarda en Mongo las alertas ya validadas contra catálogo y GLPI (y
+     * reactiva las que Meraki volvió a levantar). Compartido entre el ciclo
+     * de polling y `ingestActiveAlerts`.
+     */
+    async persistValidatedAlerts(validateAlerts: IAlertCiscoGlpi[]) {
+        const savePromises = validateAlerts.map(
+             async (alertValidate: IAlertCiscoGlpi) => {
+               const alertToSave: IAlert = {
+                 alertId: alertValidate.id,
+                 organization: {
+                   id: this.organizationId,
+                   name: this.organizationName,
+                 },
+                 categoryType: alertValidate.categoryType,
+                 network: alertValidate.network,
+                 startedAt: alertValidate.startedAt,
+                 dismissedAt: alertValidate.dismissedAt,
+                 resolvedAt: alertValidate.resolvedAt,
+                 deviceType: alertValidate.deviceType,
+                 type: alertValidate.type,
+                 title: alertValidate.title,
+                 description: alertValidate.description || "",
+                 severity: alertValidate.severity,
+                 scope: alertValidate.scope,
+                 descriptionGlpi: alertValidate.descriptionGlpi,
+                 isGlpi: alertValidate.isGlpi,
+                 comment: alertValidate.comment || "",
+                 isTcp: false,
+                 location: alertValidate.location,
+               };
+               await saveAlert(alertToSave);
+               if (alertToSave.resolvedAt === null || alertToSave.resolvedAt === undefined) {
+                 await handleReactivation(alertToSave.alertId, alertToSave.startedAt);
+               }
+             }
+           );
+        await Promise.all(savePromises);
+    }
+
+    /**
+     * Procesa alertas activas ya traídas de la API de Meraki fuera del ciclo
+     * de polling (la verificación por red que dispara el webhook, ver
+     * workers/webhookAlerts.worker.ts): mismo filtro de redes estacionamiento,
+     * de alertas ya conocidas, de catálogo + GLPI y mismo guardado que
+     * `getActiveAlerts`.
+     */
+    async ingestActiveAlerts(alerts: IAlertCisco[]) {
+        const pageData = alerts.filter((a) => !isStaleNetworkName(a.network?.name));
+        const known = await getExistingActiveAlertIds(pageData.map((a) => a.id));
+        const unknown = pageData.filter((a) => !known.has(a.id));
+        const validated = await this.validateAlertsWithGlpi(unknown);
+        await this.persistValidatedAlerts(validated);
+        return {
+            seen: alerts.length,
+            stale_network_skipped: alerts.length - pageData.length,
+            already_known: pageData.length - unknown.length,
+            not_in_catalog: unknown.length - validated.length,
+            saved: validated.length,
+        };
     }
 
     /**
