@@ -63,22 +63,36 @@ export async function enqueueWebhookAlert(
 }
 
 /**
- * Verificación por red disparada por webhook: un `stopped_reporting` es solo
- * el aviso de que algo se cayó en esa red -- no trae equipo ni el id de la
- * alerta de Assurance, y la mitad son parpadeos que Assurance nunca eleva
- * (medido 5-oct-2026: producción solo registra caídas de 15 min o más). Se
- * agenda una consulta a la API de Meraki pasado ese umbral, para que Assurance
- * decida qué es alerta real y traiga el detalle por equipo y el id real.
+ * Verificación por red disparada por webhook. Un `stopped_reporting` o un
+ * `started_reporting` es solo el aviso de que algo cambió en esa red -- no
+ * trae equipo ni el id de la alerta de Assurance (el `alertId` del webhook NO
+ * existe en la API: GET assurance/alerts/{id} da 404). Por eso el aviso no se
+ * guarda tal cual: se agenda una consulta a la API de Meraki y es Assurance
+ * quien decide qué es alerta real y qué ya cesó, con el detalle por equipo y
+ * el id de la API (el mismo que usa el polling).
+ *
+ * - `stopped_reporting` -> `verify-network` tras ~15 min. Producción solo
+ *   registra caídas de 15 min o más (medido 5-oct-2026); antes de eso es un
+ *   parpadeo que Assurance nunca eleva.
+ * - `started_reporting` -> `verify-resolution` tras unos minutos: cierra las
+ *   alertas de esa red que Meraki ya marcó resueltas.
  *
  * Desactivado por defecto: solo `-wh` lo activa con
  * WEBHOOK_VERIFY_ENABLED=true. La consulta real y su agrupación por red viven
- * en `workers/webhookAlerts.worker.ts` (processNetworkVerification).
+ * en `workers/webhookAlerts.worker.ts` (processNetworkVerification /
+ * processNetworkResolution).
  */
 export const VERIFY_NETWORK_JOB_NAME = "verify-network";
+export const VERIFY_RESOLUTION_JOB_NAME = "verify-resolution";
 
 const VERIFY_ENABLED = process.env.WEBHOOK_VERIFY_ENABLED === "true";
 const VERIFY_DELAY_MS = parseInt(
   process.env.WEBHOOK_VERIFY_DELAY_MS || String(15 * 60 * 1000),
+  10,
+);
+// Assurance marca resuelta la alerta poco después de que el equipo vuelve.
+const VERIFY_RESOLUTION_DELAY_MS = parseInt(
+  process.env.WEBHOOK_VERIFY_CESE_DELAY_MS || String(3 * 60 * 1000),
   10,
 );
 
@@ -87,10 +101,18 @@ export interface VerifyNetworkJobData {
   networkName: string;
   organizationId: string;
   eventAt: string;
+  // Solo `verify-resolution`: 0 la primera vez, 1 en el único reintento.
+  retry?: number;
 }
 
+const VERIFY_JOB_BY_ALERT_TYPE: Record<string, { name: string; delay: number }> = {
+  stopped_reporting: { name: VERIFY_NETWORK_JOB_NAME, delay: VERIFY_DELAY_MS },
+  started_reporting: { name: VERIFY_RESOLUTION_JOB_NAME, delay: VERIFY_RESOLUTION_DELAY_MS },
+};
+
 async function scheduleNetworkVerification(payload: MerakiWebhookAlertPayload) {
-  if (!VERIFY_ENABLED || payload.alertType !== "stopped_reporting" || !payload.networkId) {
+  const target = VERIFY_JOB_BY_ALERT_TYPE[payload.alertType ?? ""];
+  if (!VERIFY_ENABLED || !target || !payload.networkId) {
     return;
   }
   // Un fallo acá no debe devolver 500 a Meraki: reintentaría el mismo
@@ -101,21 +123,36 @@ async function scheduleNetworkVerification(payload: MerakiWebhookAlertPayload) {
       networkName: payload.networkName ?? "",
       organizationId: payload.organizationId ?? "",
       eventAt: payload.startedAt ?? payload.sentAt ?? new Date().toISOString(),
+      retry: 0,
     };
-    // Un job por evento, sin jobId: cada caída se verifica 15 min DESPUÉS de
-    // su propio aviso. La agrupación (una sola consulta cuando 10 APs de la
-    // misma sede caen juntos) se hace al ejecutar, con un candado por red.
-    await webhookAlertsQueue.add(VERIFY_NETWORK_JOB_NAME, data, {
-      delay: VERIFY_DELAY_MS,
+    // Un job por evento, sin jobId: cada aviso se verifica DESPUÉS de su
+    // propio retraso. La agrupación (una sola consulta cuando 10 APs de la
+    // misma sede cambian juntos) se hace al ejecutar, con un candado por red.
+    await webhookAlertsQueue.add(target.name, data, {
+      delay: target.delay,
       removeOnComplete: 100,
       removeOnFail: 100,
     });
   } catch (err: any) {
     log.warn("webhook_verify.schedule_failed", {
       networkId: payload.networkId,
+      alertType: payload.alertType,
       message: err?.message,
     });
   }
+}
+
+/**
+ * Único reintento de `verify-resolution`: si Assurance todavía no había
+ * marcado resuelta alguna alerta cuando se consultó, se vuelve a mirar más
+ * tarde. Acotado a un reintento para no dejar consultas en bucle.
+ */
+export async function scheduleResolutionRetry(data: VerifyNetworkJobData) {
+  await webhookAlertsQueue.add(
+    VERIFY_RESOLUTION_JOB_NAME,
+    { ...data, retry: (data.retry ?? 0) + 1 },
+    { delay: VERIFY_RESOLUTION_DELAY_MS * 2, removeOnComplete: 100, removeOnFail: 100 },
+  );
 }
 
 export async function closeWebhookAlertsQueue() {

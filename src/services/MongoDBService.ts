@@ -66,6 +66,22 @@ export const handleReactivation = async (
 };
 
 /**
+ * alertId de las alertas vivas (resolvedAt:null) de una red. Lo usa la
+ * verificación de cese disparada por webhook para saber, ANTES de consultar a
+ * Meraki, si hay algo que cerrar en esa red -- sin alertas abiertas no se hace
+ * ninguna llamada a la API.
+ */
+export const getActiveAlertIdsByNetwork = async (
+  networkId: string
+): Promise<string[]> => {
+  const docs = await Alert.find(
+    { "network.id": networkId, resolvedAt: null },
+    { alertId: 1, _id: 0 }
+  ).lean<{ alertId: string }[]>();
+  return docs.map((d) => d.alertId);
+};
+
+/**
  * Devuelve los alertId que ya están en MEP DB con resolvedAt:null (vivos).
  * Usado por el sync incremental: si todos los IDs de una página de Cisco
  * ya están aquí como activos, no hay nada nuevo y se puede cortar la paginación.

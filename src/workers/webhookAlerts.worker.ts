@@ -3,14 +3,21 @@ import { redisConnection } from "../config/redis";
 import {
   WEBHOOK_ALERTS_QUEUE_NAME,
   VERIFY_NETWORK_JOB_NAME,
+  VERIFY_RESOLUTION_JOB_NAME,
   VerifyNetworkJobData,
+  scheduleResolutionRetry,
 } from "../queues/webhookAlerts.queue";
 import { fetchMerakiPage } from "../queues/meraki.queue";
 import { MerakiWebhookAlertPayload } from "../interfaces/IMerakiWebhookAlert";
 import { mapMerakiWebhookAlert } from "../functions/mapMerakiWebhookAlert";
 import CatalogService from "../services/catalog.service";
 import ActiveAlertsService from "../services/active.alerts.service";
-import { saveAlert, handleReactivation } from "../services/MongoDBService";
+import {
+  saveAlert,
+  handleReactivation,
+  updateAlertResolved,
+  getActiveAlertIdsByNetwork,
+} from "../services/MongoDBService";
 import { IAlert } from "../interfaces/IAlert";
 import { log } from "../utils/logger";
 import WebhookTest from "../models/WebhookTest";
@@ -85,11 +92,102 @@ async function processNetworkVerification(job: Job<VerifyNetworkJobData>) {
   }
 }
 
+// El candado de cese es más corto que su retraso (3 min por defecto): así dos
+// recuperaciones separadas por más de esa ventana sí consultan cada una.
+const RESOLUTION_COALESCE_S = Math.ceil(
+  parseInt(process.env.WEBHOOK_VERIFY_CESE_COALESCE_MS || String(60 * 1000), 10) / 1000,
+);
+const MAX_RESOLUTION_RETRIES = 1;
+
+/**
+ * Pasados unos minutos desde un `started_reporting`, cierra las alertas de esa
+ * red que Meraki ya marcó resueltas. Mismo cierre que el polling de ceses
+ * (`updateAlertResolved`, que deja la alerta pendiente de envío), pero la
+ * consulta es una sola por red y solo si en Mongo hay algo abierto: la
+ * mayoría de las recuperaciones son parpadeos que nunca generaron alerta, y
+ * esas no tocan la API de Meraki.
+ */
+async function processNetworkResolution(job: Job<VerifyNetworkJobData>) {
+  const { networkId, networkName, eventAt } = job.data;
+  const retry = job.data.retry ?? 0;
+  const orgId = process.env.ORGANIZATION_ID || job.data.organizationId;
+
+  const openIds = await getActiveAlertIdsByNetwork(networkId);
+  if (openIds.length === 0) {
+    await job.log(`Red ${networkId} sin alertas abiertas -- no se consulta a Meraki.`);
+    return { skipped: true, reason: "no_open_alerts" };
+  }
+
+  const lockKey = `webhook_verify:cese-lock:${networkId}`;
+  const acquired = await redisConnection.set(lockKey, "1", "EX", RESOLUTION_COALESCE_S, "NX");
+  if (!acquired) {
+    await job.log(`Red ${networkId} ya consultada hace menos de ${RESOLUTION_COALESCE_S}s -- se agrupa con esa consulta.`);
+    return { skipped: true, reason: "recently_verified" };
+  }
+
+  try {
+    // Sin sortBy explícito a propósito: ver nota en cese.alerts.service.ts
+    // (con sortBy=resolvedAt Cisco devuelve primero los resolvedAt:null).
+    const result = await fetchMerakiPage(
+      {
+        url: `https://api.meraki.com/api/v1/organizations/${orgId}/assurance/alerts`,
+        method: "GET",
+        params: { networkId, active: false, resolved: true, sortOrder: "descending", perPage: 100 },
+      },
+      "webhook-verify-cese",
+    );
+    if (!result || result.status !== 200) {
+      throw new Error(`Meraki no respondió 200 (status=${result?.status ?? "sin respuesta"})`);
+    }
+
+    const resolved = new Map<string, string>(
+      (Array.isArray(result.data) ? result.data : [])
+        .filter((a: any) => a?.id && a?.resolvedAt)
+        .map((a: any) => [String(a.id), String(a.resolvedAt)] as [string, string]),
+    );
+
+    let closed = 0;
+    for (const alertId of openIds) {
+      const resolvedAt = resolved.get(alertId);
+      if (!resolvedAt) continue;
+      try {
+        await updateAlertResolved(alertId, resolvedAt);
+        closed++;
+      } catch (err: any) {
+        log.warn("webhook_verify.resolution.update_failed", { alertId, message: err?.message });
+      }
+    }
+
+    // Si esta recuperación no cerró nada, puede que Assurance aún no la haya
+    // marcado resuelta: se mira una vez más más tarde. Si cerró alguna, lo
+    // que queda abierto son equipos que siguen caídos de verdad.
+    const retryScheduled = closed === 0 && retry < MAX_RESOLUTION_RETRIES;
+    if (retryScheduled) await scheduleResolutionRetry(job.data);
+
+    const summary = {
+      open: openIds.length,
+      resolved_listed: resolved.size,
+      closed,
+      still_open: openIds.length - closed,
+      retry_scheduled: retryScheduled,
+    };
+    await job.log(`Cese de ${networkName || networkId} (aviso ${eventAt}): ${JSON.stringify(summary)}`);
+    log.info("webhook_verify.resolution", { networkId, eventAt, retry, ...summary });
+    return { verified: true, ...summary };
+  } catch (err) {
+    await redisConnection.del(lockKey);
+    throw err;
+  }
+}
+
 export const webhookAlertsWorker = new Worker(
   WEBHOOK_ALERTS_QUEUE_NAME,
   async (job: Job<MerakiWebhookAlertPayload>) => {
     if (job.name === VERIFY_NETWORK_JOB_NAME) {
       return processNetworkVerification(job as unknown as Job<VerifyNetworkJobData>);
+    }
+    if (job.name === VERIFY_RESOLUTION_JOB_NAME) {
+      return processNetworkResolution(job as unknown as Job<VerifyNetworkJobData>);
     }
     const raw = job.data;
     await job.log(
