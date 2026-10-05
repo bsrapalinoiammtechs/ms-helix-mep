@@ -37,7 +37,7 @@ services:
     ports:
       - "${REDIS_LOCAL_PORT}:6379" # Para acceder a Redis desde tu máquina local
     volumes:
-      - redis_wh_data:/data
+      - redis_data:/data # ver bloque `volumes:` al final -- nombre del volumen por organización (ORG_SLUG)
     networks:
       - ms-helix-network
 
@@ -75,5 +75,11 @@ volumes:
   # volumen real existente sin importar de qué carpeta/clave se despliegue.
   mongodb_data:
     name: ${MONGO_VOLUME_NAME}
-  redis_wh_data:
-    name: redis_wh_data
+  # Redis persistente (AOF) para que un `down`/recreate no pierda las colas de
+  # BullMQ (verificaciones pendientes del webhook, gateway de rate-limit).
+  # `name:` lleva ORG_SLUG a propósito: un nombre de volumen explícito es
+  # GLOBAL en el host de Docker, y todas las organizaciones comparten host --
+  # con un nombre fijo, dos Redis de organizaciones distintas montarían el
+  # mismo volumen y mezclarían (o corromperían) sus colas.
+  redis_data:
+    name: redis-data-${ORG_SLUG}
