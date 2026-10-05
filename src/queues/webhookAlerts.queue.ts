@@ -96,6 +96,18 @@ const VERIFY_RESOLUTION_DELAY_MS = parseInt(
   10,
 );
 
+// Las verificaciones comparten con el polling de producción el límite de la
+// API (1 petición cada 10 s por organización): si el gateway agota sus
+// reintentos de 429, el job falla. Con los 3 intentos y 5 s de espera por
+// defecto de esta cola, una racha de 429 perdía la alerta -- se espera más
+// y se reintenta más veces.
+const VERIFY_ATTEMPTS = parseInt(process.env.WEBHOOK_VERIFY_ATTEMPTS || "5", 10);
+const VERIFY_BACKOFF_MS = parseInt(process.env.WEBHOOK_VERIFY_BACKOFF_MS || "60000", 10);
+const VERIFY_JOB_RETRY_OPTIONS = {
+  attempts: VERIFY_ATTEMPTS,
+  backoff: { type: "exponential" as const, delay: VERIFY_BACKOFF_MS },
+};
+
 export interface VerifyNetworkJobData {
   networkId: string;
   networkName: string;
@@ -104,6 +116,12 @@ export interface VerifyNetworkJobData {
   // Solo `verify-resolution`: 0 la primera vez, 1 en el único reintento.
   retry?: number;
 }
+
+// Redes de las que llegó un `stopped_reporting` (score = momento de llegada,
+// reloj de este servidor). El barrido de ceses (processResolutionSweep) solo
+// guarda alertas ya resueltas de estas redes, para que siga siendo una
+// reacción al webhook y no un polling general de toda la organización.
+export const RECENT_NETWORKS_KEY = "webhook_verify:recent_networks";
 
 const VERIFY_JOB_BY_ALERT_TYPE: Record<string, { name: string; delay: number }> = {
   stopped_reporting: { name: VERIFY_NETWORK_JOB_NAME, delay: VERIFY_DELAY_MS },
@@ -125,11 +143,15 @@ async function scheduleNetworkVerification(payload: MerakiWebhookAlertPayload) {
       eventAt: payload.startedAt ?? payload.sentAt ?? new Date().toISOString(),
       retry: 0,
     };
+    if (payload.alertType === "stopped_reporting") {
+      await redisConnection.zadd(RECENT_NETWORKS_KEY, Date.now(), payload.networkId);
+    }
     // Un job por evento, sin jobId: cada aviso se verifica DESPUÉS de su
     // propio retraso. La agrupación (una sola consulta cuando 10 APs de la
     // misma sede cambian juntos) se hace al ejecutar, con un candado por red.
     await webhookAlertsQueue.add(target.name, data, {
       delay: target.delay,
+      ...VERIFY_JOB_RETRY_OPTIONS,
       removeOnComplete: 100,
       removeOnFail: 100,
     });
@@ -143,6 +165,29 @@ async function scheduleNetworkVerification(payload: MerakiWebhookAlertPayload) {
 }
 
 /**
+ * Barrido de respaldo de ceses. `verify-resolution` depende de que llegue un
+ * `started_reporting` por cada equipo, y Meraki los manda agrupados por red,
+ * así que una alerta puede quedar abierta aunque Assurance ya la resolvió
+ * (visto en vivo 5-oct-2026: resuelta en Meraki y 12 min después seguía
+ * abierta en Mongo). El barrido no depende de avisos: cada N minutos mira UNA
+ * lista de resueltas de la organización y cierra lo que corresponda. Sin
+ * alertas abiertas no consulta nada.
+ *
+ * jobId fijo: si una corrida sigue pendiente o en curso, la siguiente no se
+ * encola -- nunca se solapan dos barridos.
+ */
+export const SWEEP_RESOLUTIONS_JOB_NAME = "sweep-resolutions";
+
+export async function enqueueResolutionSweep() {
+  if (!VERIFY_ENABLED) return;
+  await webhookAlertsQueue.add(SWEEP_RESOLUTIONS_JOB_NAME, {}, {
+    jobId: SWEEP_RESOLUTIONS_JOB_NAME,
+    removeOnComplete: true,
+    removeOnFail: true,
+  });
+}
+
+/**
  * Único reintento de `verify-resolution`: si Assurance todavía no había
  * marcado resuelta alguna alerta cuando se consultó, se vuelve a mirar más
  * tarde. Acotado a un reintento para no dejar consultas en bucle.
@@ -151,7 +196,12 @@ export async function scheduleResolutionRetry(data: VerifyNetworkJobData) {
   await webhookAlertsQueue.add(
     VERIFY_RESOLUTION_JOB_NAME,
     { ...data, retry: (data.retry ?? 0) + 1 },
-    { delay: VERIFY_RESOLUTION_DELAY_MS * 2, removeOnComplete: 100, removeOnFail: 100 },
+    {
+      delay: VERIFY_RESOLUTION_DELAY_MS * 2,
+      ...VERIFY_JOB_RETRY_OPTIONS,
+      removeOnComplete: 100,
+      removeOnFail: 100,
+    },
   );
 }
 

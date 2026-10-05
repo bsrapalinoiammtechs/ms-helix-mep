@@ -4,6 +4,8 @@ import {
   WEBHOOK_ALERTS_QUEUE_NAME,
   VERIFY_NETWORK_JOB_NAME,
   VERIFY_RESOLUTION_JOB_NAME,
+  SWEEP_RESOLUTIONS_JOB_NAME,
+  RECENT_NETWORKS_KEY,
   VerifyNetworkJobData,
   scheduleResolutionRetry,
 } from "../queues/webhookAlerts.queue";
@@ -17,6 +19,7 @@ import {
   handleReactivation,
   updateAlertResolved,
   getActiveAlertIdsByNetwork,
+  getOpenAlertsForSweep,
 } from "../services/MongoDBService";
 import { IAlert } from "../interfaces/IAlert";
 import { log } from "../utils/logger";
@@ -180,6 +183,141 @@ async function processNetworkResolution(job: Job<VerifyNetworkJobData>) {
   }
 }
 
+const SWEEP_MAX_PAGES = parseInt(process.env.WEBHOOK_VERIFY_SWEEP_MAX_PAGES || "3", 10);
+// Hasta cuántas horas hacia atrás cuenta un `stopped_reporting` para que el
+// barrido guarde alertas ya resueltas de esa red.
+const SWEEP_LOOKBACK_MS = parseInt(
+  process.env.WEBHOOK_VERIFY_SWEEP_LOOKBACK_MS || String(3 * 60 * 60 * 1000),
+  10,
+);
+
+// Tope de antigüedad hacia atrás de un barrido, sin importar qué tan vieja sea
+// la alerta abierta más antigua.
+const SWEEP_MAX_AGE_MS = parseInt(
+  process.env.WEBHOOK_VERIFY_SWEEP_MAX_AGE_MS || String(24 * 60 * 60 * 1000),
+  10,
+);
+
+function nextPageUrl(headers: Record<string, any> | undefined): string | null {
+  const match = String(headers?.["link"] || "").match(/<([^>]+)>;s*rel=next/);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Respaldo de `processNetworkVerification` y `processNetworkResolution`: no
+ * depende de ningún aviso puntual. Lee UNA lista de alertas RESUELTAS de la
+ * organización (ordenada por resolvedAt descendente; pagina más solo si hace
+ * falta, hasta SWEEP_MAX_PAGES) y con ella hace dos cosas:
+ *
+ * 1. Cierra las alertas abiertas de Mongo que Meraki ya resolvió.
+ * 2. Guarda las resueltas que NUNCA se guardaron -- una caída que duró lo
+ *    bastante para que Assurance la levantara pero cesó antes de la
+ *    verificación (visto 5-oct-2026: caídas de 22-24 min que producción
+ *    registró y -wh no). Solo de redes con un `stopped_reporting` reciente,
+ *    para que siga siendo una reacción al webhook y no un polling de toda la
+ *    organización.
+ *
+ * Sin abiertas ni redes recientes no toca la API. Lo resuelto hace más de lo
+ * que alcanzan las páginas se limpia con la conciliación existente.
+ */
+async function processResolutionSweep(job: Job) {
+  const now = Date.now();
+  await redisConnection.zremrangebyscore(RECENT_NETWORKS_KEY, "-inf", now - SWEEP_LOOKBACK_MS);
+  const recentNetworks = new Set(await redisConnection.zrange(RECENT_NETWORKS_KEY, 0, -1));
+  const open = await getOpenAlertsForSweep();
+
+  if (open.length === 0 && recentNetworks.size === 0) {
+    await job.log("Sin alertas abiertas ni redes recientes -- no se consulta a Meraki.");
+    return { skipped: true, reason: "nothing_to_sweep" };
+  }
+
+  const orgId = process.env.ORGANIZATION_ID || "";
+  const pending = new Set(open.map((a) => a.alertId));
+  const openStarts = open.map((a) => Date.parse(a.startedAt)).filter((t) => !Number.isNaN(t));
+  const oldestOpenMs = openStarts.length ? Math.min(...openStarts) : Infinity;
+
+  let url: string | null = `https://api.meraki.com/api/v1/organizations/${orgId}/assurance/alerts`;
+  let params: Record<string, any> | undefined = {
+    active: false,
+    resolved: true,
+    sortOrder: "descending",
+    perPage: 300,
+  };
+  let pages = 0;
+  let listed = 0;
+  let closed = 0;
+  let floorMs = oldestOpenMs;
+  const ingested = { candidates: 0, already_known: 0, not_in_catalog: 0, saved: 0 };
+
+  while (url && pages < SWEEP_MAX_PAGES) {
+    const result = await fetchMerakiPage({ url, method: "GET", params }, "webhook-sweep-cese");
+    if (!result || result.status !== 200) {
+      throw new Error(`Meraki no respondió 200 (status=${result?.status ?? "sin respuesta"})`);
+    }
+    pages++;
+    const page: any[] = Array.isArray(result.data) ? result.data : [];
+    listed += page.length;
+
+    // El piso de fecha se toma de la resuelta más reciente que devuelve
+    // Meraki (no de este servidor, cuyo reloj va adelantado): hasta ahí hacia
+    // atrás cuentan las redes recientes.
+    if (pages === 1) {
+      const newestMs = Date.parse(page[0]?.resolvedAt ?? "");
+      if (!Number.isNaN(newestMs)) {
+        if (recentNetworks.size > 0) floorMs = Math.min(floorMs, newestMs - SWEEP_LOOKBACK_MS);
+        // Una alerta abierta muy vieja (ej. de pruebas, abierta desde hace
+        // semanas) no debe obligar a paginar todo el historial en cada
+        // barrido: nunca se baja de SWEEP_MAX_AGE_MS. Lo más antiguo lo
+        // limpia la conciliación existente.
+        floorMs = Math.max(floorMs, newestMs - SWEEP_MAX_AGE_MS);
+      }
+    }
+
+    for (const a of page) {
+      if (!a?.id || !a?.resolvedAt || !pending.has(String(a.id))) continue;
+      try {
+        await updateAlertResolved(String(a.id), String(a.resolvedAt));
+        pending.delete(String(a.id));
+        closed++;
+      } catch (err: any) {
+        log.warn("webhook_verify.sweep.update_failed", { alertId: a.id, message: err?.message });
+      }
+    }
+
+    const ofRecentNetworks = page.filter((a) => a?.resolvedAt && recentNetworks.has(a.network?.id));
+    if (ofRecentNetworks.length > 0) {
+      const r = await glpiValidator.ingestResolvedAlerts(ofRecentNetworks);
+      ingested.candidates += r.seen;
+      ingested.already_known += r.already_known;
+      ingested.not_in_catalog += r.not_in_catalog;
+      ingested.saved += r.saved;
+    }
+
+    // Las páginas vienen de la más reciente a la más antigua: si la última
+    // resuelta de esta página es anterior al piso, más atrás no hay nada
+    // que nos interese.
+    const lastResolvedMs = Date.parse(page[page.length - 1]?.resolvedAt ?? "");
+    if (page.length === 0 || (!Number.isNaN(lastResolvedMs) && lastResolvedMs < floorMs)) break;
+    if (pending.size === 0 && recentNetworks.size === 0) break;
+
+    url = nextPageUrl(result.headers);
+    params = undefined; // el Link de la siguiente página ya trae los parámetros
+  }
+
+  const summary = {
+    open: open.length,
+    recent_networks: recentNetworks.size,
+    pages,
+    listed,
+    closed,
+    still_open: pending.size,
+    ingested_resolved: ingested,
+  };
+  await job.log(`Barrido de ceses: ${JSON.stringify(summary)}`);
+  log.info("webhook_verify.sweep", summary);
+  return { swept: true, ...summary };
+}
+
 export const webhookAlertsWorker = new Worker(
   WEBHOOK_ALERTS_QUEUE_NAME,
   async (job: Job<MerakiWebhookAlertPayload>) => {
@@ -188,6 +326,9 @@ export const webhookAlertsWorker = new Worker(
     }
     if (job.name === VERIFY_RESOLUTION_JOB_NAME) {
       return processNetworkResolution(job as unknown as Job<VerifyNetworkJobData>);
+    }
+    if (job.name === SWEEP_RESOLUTIONS_JOB_NAME) {
+      return processResolutionSweep(job);
     }
     const raw = job.data;
     await job.log(

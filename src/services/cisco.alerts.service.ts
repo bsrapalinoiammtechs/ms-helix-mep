@@ -9,6 +9,19 @@ type MerakiParams = {
   perPage: number;
   sortOrder: string;
   sortBy?: string;
+  // Filtra por tipo de alerta de Assurance (`types[]` en la API de Meraki).
+  // Sin definir, se piden todos -- comportamiento de siempre.
+  types?: string[];
+}
+
+/**
+ * Lee una lista de tipos separada por comas desde una variable de entorno
+ * (ej. "crc_errors,dns_down") y la normaliza. Vacío o sin definir => undefined,
+ * o sea sin filtro por tipo.
+ */
+export function parseAlertTypes(raw: string | undefined): string[] | undefined {
+  const types = (raw || "").split(",").map((t) => t.trim()).filter(Boolean);
+  return types.length > 0 ? types : undefined;
 }
 
 class CiscoAlertsService {
@@ -24,7 +37,7 @@ class CiscoAlertsService {
   // nuevo en cada tick del cron). null = próxima llamada es la página 1.
   private nextUrl: string | null = null;
 
-  constructor({ active, resolved, perPage, sortOrder, sortBy }: MerakiParams) {
+  constructor({ active, resolved, perPage, sortOrder, sortBy, types }: MerakiParams) {
     this.orgid =  process.env["ORGANIZATION_ID"] || "";
     this.token =  process.env["TOKEN_CISCO"] || "";
     this.alertsProcessed = 0;
@@ -36,6 +49,7 @@ class CiscoAlertsService {
       perPage,
       sortOrder,
       ...(sortBy ? { sortBy } : {}),
+      ...(types && types.length > 0 ? { types } : {}),
     };
   }
 

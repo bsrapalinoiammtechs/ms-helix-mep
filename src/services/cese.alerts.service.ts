@@ -1,4 +1,4 @@
-import CiscoAlertsService from "./cisco.alerts.service";
+import CiscoAlertsService, { parseAlertTypes } from "./cisco.alerts.service";
 import { AxiosResponse } from "axios";
 import { IAlertCisco } from "../interfaces/IAlertCisco";
 import { setIsTCpAlert, updateAlertResolved, saveAlert, getExistingActiveAlertIds, getExistingCesedAlertIds } from "./MongoDBService";
@@ -53,11 +53,15 @@ class CeseAlertsService {
         // imposibilitando el procesamiento de cesaciones reales.
         // El default de Cisco para resolved=true sí ordena por resolvedAt desc
         // y excluye los nulls — ese es el comportamiento que queremos.
+        // CISCO_CESE_TYPES (lista separada por comas, opcional): igual que
+        // CISCO_ACTIVE_TYPES pero para el polling de ceses. Sin definir:
+        // todos, como siempre.
         this.apiMeraki = new CiscoAlertsService({
             active: false,
             resolved: true,
             perPage: 300,
             sortOrder: "descending",
+            types: parseAlertTypes(process.env.CISCO_CESE_TYPES),
         });
     }
 

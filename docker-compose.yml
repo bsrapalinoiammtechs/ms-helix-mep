@@ -33,8 +33,11 @@ services:
     image: redis:7-alpine
     restart: always
     container_name: redis-helix-${ORG_SLUG}
+    command: redis-server --appendonly yes
     ports:
       - "${REDIS_LOCAL_PORT}:6379" # Para acceder a Redis desde tu máquina local
+    volumes:
+      - redis_wh_data:/data
     networks:
       - ms-helix-network
 
@@ -72,3 +75,5 @@ volumes:
   # volumen real existente sin importar de qué carpeta/clave se despliegue.
   mongodb_data:
     name: ${MONGO_VOLUME_NAME}
+  redis_wh_data:
+    name: redis_wh_data

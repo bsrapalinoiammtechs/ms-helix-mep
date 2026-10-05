@@ -45,7 +45,7 @@ import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { merakiQueue } from "./queues/meraki.queue";
 import { sendAlertsQueue, enqueueSendAlertsCycle } from "./queues/sendAlerts.queue";
-import { webhookAlertsQueue, enqueueWebhookAlert } from "./queues/webhookAlerts.queue";
+import { webhookAlertsQueue, enqueueWebhookAlert, enqueueResolutionSweep } from "./queues/webhookAlerts.queue";
 import { webhookCesesQueue, enqueueWebhookCese } from "./queues/webhookCeses.queue";
 import { epistechWebhookQueue } from "./queues/epistechWebhook.queue";
 import { staleAlertCleanupQueue, enqueueStaleAlertCleanupCycle } from "./queues/staleAlertCleanup.queue";
@@ -191,6 +191,26 @@ if (staleCleanupEnabled) {
   }
 } else {
   log.info("cron.stale_cleanup.disabled");
+}
+
+// Barrido de respaldo de ceses por webhook (solo con WEBHOOK_VERIFY_ENABLED=true,
+// o sea la instancia -wh) -- ver enqueueResolutionSweep en
+// queues/webhookAlerts.queue.ts. Encola un job con jobId fijo, así que dos
+// barridos nunca se solapan, y no consulta a Meraki si no hay nada abierto.
+const resolutionSweepSchedule = process.env.WEBHOOK_VERIFY_SWEEP_CRON || "*/10 * * * *";
+if (process.env.WEBHOOK_VERIFY_ENABLED === "true") {
+  if (!cron.validate(resolutionSweepSchedule)) {
+    log.error("cron.webhook_sweep.invalid_schedule", { schedule: resolutionSweepSchedule });
+  } else {
+    cron.schedule(resolutionSweepSchedule, async () => {
+      try {
+        await enqueueResolutionSweep();
+      } catch (err: any) {
+        log.error("cron.webhook_sweep.error", { message: err?.message });
+      }
+    });
+    log.info("cron.webhook_sweep.scheduled", { schedule: resolutionSweepSchedule });
+  }
 }
 
 const app = express();

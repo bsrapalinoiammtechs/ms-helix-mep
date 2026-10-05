@@ -1,4 +1,4 @@
-import CiscoAlertsService from "./cisco.alerts.service";
+import CiscoAlertsService, { parseAlertTypes } from "./cisco.alerts.service";
 import { AxiosResponse } from "axios";
 import { IAlertCisco } from "../interfaces/IAlertCisco";
 import { getNetworkData, getNetworkId, getSessionToken } from "./GlpiAPIService";
@@ -6,7 +6,7 @@ import { INetworkGlpi } from "../interfaces/INetworkGlpiResponse";
 import { DescriptionEnum } from "../enums/DescriptionEnum";
 import lodash from "lodash";
 import { IAlert } from "../interfaces/IAlert";
-import { saveAlert, setIsTCpAlert, handleReactivation, getExistingActiveAlertIds } from "./MongoDBService";
+import { saveAlert, setIsTCpAlert, handleReactivation, getExistingActiveAlertIds, getExistingCesedAlertIds } from "./MongoDBService";
 import { isStaleNetworkName } from "../utils/staleNetwork";
 import { recordSync } from "../models/SyncState";
 import { IAlertHelix } from "../interfaces/IAlertHelix";
@@ -47,11 +47,16 @@ class ActiveAlertsService {
         this.organizationId =  process.env["ORGANIZATION_ID"] || "";
         this.organizationName =  process.env["ORGANIZATION_NAME"] || "";
 
+        // CISCO_ACTIVE_TYPES (lista separada por comas, opcional): limita el
+        // polling de activas a esos tipos de Assurance. Pensado para cuando
+        // otros tipos (ej. `unreachable`) ya llegan por webhook y no hace
+        // falta pedirlos por polling. Sin definir: todos, como siempre.
         this.apiMeraki = new CiscoAlertsService({
             active: true,
             resolved: false,
             perPage: 300,
-            sortOrder: "descending"
+            sortOrder: "descending",
+            types: parseAlertTypes(process.env.CISCO_ACTIVE_TYPES),
         });
     }
 
@@ -216,6 +221,34 @@ class ActiveAlertsService {
         const pageData = alerts.filter((a) => !isStaleNetworkName(a.network?.name));
         const known = await getExistingActiveAlertIds(pageData.map((a) => a.id));
         const unknown = pageData.filter((a) => !known.has(a.id));
+        const validated = await this.validateAlertsWithGlpi(unknown);
+        await this.persistValidatedAlerts(validated);
+        return {
+            seen: alerts.length,
+            stale_network_skipped: alerts.length - pageData.length,
+            already_known: pageData.length - unknown.length,
+            not_in_catalog: unknown.length - validated.length,
+            saved: validated.length,
+        };
+    }
+
+    /**
+     * Guarda alertas que Meraki ya marcó RESUELTAS y que nunca llegamos a
+     * guardar como activas -- una caída que duró lo bastante para que
+     * Assurance la levantara pero que cesó antes de que `ingestActiveAlerts`
+     * la consultara (visto 5-oct-2026: caídas de 22 a 24 min que producción
+     * registró y `-wh` no). Mismo guardado que el polling de ceses con sus
+     * alertas "nuevas ya resueltas" (cese.alerts.service.ts): se persisten con
+     * su `resolvedAt` y quedan pendientes de envío.
+     */
+    async ingestResolvedAlerts(alerts: IAlertCisco[]) {
+        const pageData = alerts.filter((a) => !isStaleNetworkName(a.network?.name));
+        const ids = pageData.map((a) => a.id);
+        const [activeIds, cesedIds] = await Promise.all([
+            getExistingActiveAlertIds(ids),
+            getExistingCesedAlertIds(ids),
+        ]);
+        const unknown = pageData.filter((a) => a.resolvedAt && !activeIds.has(a.id) && !cesedIds.has(a.id));
         const validated = await this.validateAlertsWithGlpi(unknown);
         await this.persistValidatedAlerts(validated);
         return {

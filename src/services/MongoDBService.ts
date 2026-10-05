@@ -82,6 +82,19 @@ export const getActiveAlertIdsByNetwork = async (
 };
 
 /**
+ * Todas las alertas vivas (resolvedAt:null) con su startedAt. Lo usa el
+ * barrido de respaldo de ceses por webhook (workers/webhookAlerts.worker.ts,
+ * processResolutionSweep) para saber qué buscar entre las resueltas de Meraki
+ * y hasta qué fecha hacia atrás conviene paginar.
+ */
+export const getOpenAlertsForSweep = async (): Promise<{ alertId: string; startedAt: string }[]> => {
+  return Alert.find(
+    { resolvedAt: null },
+    { alertId: 1, startedAt: 1, _id: 0 }
+  ).lean<{ alertId: string; startedAt: string }[]>();
+};
+
+/**
  * Devuelve los alertId que ya están en MEP DB con resolvedAt:null (vivos).
  * Usado por el sync incremental: si todos los IDs de una página de Cisco
  * ya están aquí como activos, no hay nada nuevo y se puede cortar la paginación.
