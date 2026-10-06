@@ -25,6 +25,7 @@ import { IAlertHelix } from "../interfaces/IAlertHelix";
 import { FieldEnum } from "../enums/FieldEnum";
 import { AlertSeverityHelixEnum } from "../enums/AlertSeverityEnum";
 import { sendAlertsToTcp } from "../services/TcpApiService";
+import { parseAlertTypes } from "../services/cisco.alerts.service";
 import { enqueueEpistechAlerts } from "../queues/epistechWebhook.queue";
 import CatalogService from "../services/catalog.service";
 import { log } from "../utils/logger";
@@ -170,6 +171,33 @@ interface IBuiltAlert {
 }
 
 /**
+ * Silencio por tipo (respaldo): TCP_SILENT_TYPES (lista separada por comas) +
+ * TCP_SILENT_FROM (ISO, hora de ESTE servidor). Las alertas de esos tipos
+ * CREADAS desde TCP_SILENT_FROM se procesan y guardan normalmente, pero no se
+ * envían a Helix ni a Epistech: se marcan como enviadas sin enviar. Sirve
+ * para dejar el polling corriendo como respaldo de un tipo que ya llega por
+ * webhook por otra instancia, sin duplicar alertas.
+ *
+ * La fecha de corte es obligatoria a propósito: las alertas anteriores ya
+ * están en Helix, y su cese (que sale por este mismo ciclo) tiene que seguir
+ * enviándose. La clasificación depende solo de (tipo, createdAt), así que el
+ * cese de una alerta silenciada también queda silenciado. Sin
+ * TCP_SILENT_FROM válido no se silencia nada (falla hacia enviar).
+ */
+function getSilentRule(): { types: string[]; fromMs: number } | null {
+  const types = parseAlertTypes(process.env.TCP_SILENT_TYPES);
+  if (!types) return null;
+  const fromMs = Date.parse(process.env.TCP_SILENT_FROM || "");
+  if (Number.isNaN(fromMs)) {
+    log.error("send.silent.invalid_from", {
+      message: "TCP_SILENT_TYPES definido sin TCP_SILENT_FROM válido (ISO) -- no se silencia nada",
+    });
+    return null;
+  }
+  return { types, fromMs };
+}
+
+/**
  * `job` es opcional -- si viene (llamado desde sendAlerts.worker.ts), cada
  * paso queda registrado en `job.log()` y visible en la pestaña Logs de
  * bull-board. A diferencia de antes, si algo falla acá el error se
@@ -183,15 +211,44 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
     console.log("Cantidad de alertas pendientes: ", alertsFiltered?.length, new Date(Date.now()).toLocaleString('es-CO'));
     await job?.log(`Alertas pendientes de envío encontradas en Mongo: ${alertsFiltered?.length ?? 0}`);
 
-    const built: IBuiltAlert[] = await buildAlertsForHelix(alertsFiltered);
+    const builtAll: IBuiltAlert[] = await buildAlertsForHelix(alertsFiltered);
+
+    // Silencio por tipo (ver getSilentRule): se marcan como enviadas sin
+    // enviar, y el resto del ciclo sigue solo con `built`.
+    const silentRule = getSilentRule();
+    const silentIds = new Set(
+      silentRule
+        ? alertsFiltered
+            .filter(
+              (a) =>
+                silentRule.types.includes(a.type) &&
+                new Date((a as any).createdAt).getTime() >= silentRule.fromMs,
+            )
+            .map((a) => a.alertId)
+        : [],
+    );
+    const silentBuilt = builtAll.filter((b) => silentIds.has(b.payload.alertId));
+    const built: IBuiltAlert[] = builtAll.filter((b) => !silentIds.has(b.payload.alertId));
+    let silenced = 0;
+    if (silentBuilt.length > 0) {
+      const silentClaims = await Promise.allSettled(
+        silentBuilt.map(async (b) => (await setIsTCpAlert(b.payload.alertId, b.expectedResolvedAt)) !== null),
+      );
+      silenced = silentClaims.filter((r) => r.status === "fulfilled" && r.value).length;
+      await job?.log(
+        `Silenciadas (TCP_SILENT_TYPES=${process.env.TCP_SILENT_TYPES}): ${silenced} de ${silentBuilt.length} -- marcadas como enviadas sin enviar a Helix ni a Epistech.`,
+      );
+    }
+
     console.log("Alertas a enviar: ", built.length, new Date(Date.now()).toLocaleString('es-CO'));
-    await job?.log(`Alertas con regla de catálogo, listas para Helix: ${built.length} de ${alertsFiltered.length} pendientes`);
+    await job?.log(`Alertas con regla de catálogo, listas para Helix: ${built.length} de ${alertsFiltered.length} pendientes (silenciadas: ${silenced})`);
 
     if (built.length === 0) {
       await job?.log("Nada que enviar en este ciclo -- termina aquí");
       log.info("send.cron.summary", {
         received: alertsFiltered.length,
         built: 0,
+        silenced,
         tcp_success: 0,
         tcp_failed: 0,
         claimed: 0,
@@ -266,6 +323,7 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
     log.info("send.cron.summary", {
       received: alertsFiltered.length,
       built: built.length,
+      silenced,
       tcp_success: emitAlertsToHelix.success,
       tcp_failed: emitAlertsToHelix.failed,
       claimed,
