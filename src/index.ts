@@ -104,18 +104,20 @@ const ceseSchedule = resolveCron(process.env.CESE_CRON, "*/3 * * * *", "CESE_CRO
 
 if (activeEnabled) {
   cron.schedule(activeSchedule, async () => {
+     if (isProcessingActive) return;
+     isProcessingActive = true;
      const t0 = Date.now();
      try {
       console.log("---------Active Alerts:----------");
-        if (isProcessingActive) return;
-        isProcessingActive = true;
       const activeAlertsService: ActiveAlertsService = new ActiveAlertsService();
       await activeAlertsService.getActiveAlerts();
-      isProcessingActive = false;
       log.info("cron.active.done", { ms: Date.now() - t0 });
       } catch (err: any) {
         log.error("cron.active.error", { ms: Date.now() - t0, message: err?.message });
       } finally {
+        // La marca se baja SIEMPRE: si una excepción la dejaba en true, el cron
+        // saltaba todos los ciclos siguientes hasta reiniciar el contenedor.
+        isProcessingActive = false;
         console.log("### FINALIZADO  ACTIVAS###")
        }
   });
@@ -125,18 +127,18 @@ if (activeEnabled) {
 
 if (ceseEnabled) {
 cron.schedule(ceseSchedule, async () => {
+  if (isProcessingResolved) return;
+  isProcessingResolved = true;
   const t0 = Date.now();
   try {
     console.log("---------Cece Alerts:----------");
-      if (isProcessingResolved) return;
-      isProcessingResolved = true;
       const ceseAlertService: CeseAlertsService = new CeseAlertsService();
       await ceseAlertService.getCeseAlerts();
-      isProcessingResolved = false;
       log.info("cron.cese.done", { ms: Date.now() - t0 });
      } catch (err: any) {
       log.error("cron.cese.error", { ms: Date.now() - t0, message: err?.message });
      } finally {
+      isProcessingResolved = false;
       console.log("### FINALIZADO CESES ###")
      }
 });
