@@ -5,6 +5,7 @@ import {
   VERIFY_NETWORK_JOB_NAME,
   VERIFY_RESOLUTION_JOB_NAME,
   SWEEP_RESOLUTIONS_JOB_NAME,
+  SWEEP_ACTIVE_JOB_NAME,
   RECENT_NETWORKS_KEY,
   VerifyNetworkJobData,
   scheduleResolutionRetry,
@@ -199,7 +200,7 @@ const SWEEP_MAX_AGE_MS = parseInt(
 );
 
 function nextPageUrl(headers: Record<string, any> | undefined): string | null {
-  const match = String(headers?.["link"] || "").match(/<([^>]+)>;s*rel=next/);
+  const match = String(headers?.["link"] || "").match(/<([^>]+)>;\s*rel=next/);
   return match?.[1] ?? null;
 }
 
@@ -318,6 +319,57 @@ async function processResolutionSweep(job: Job) {
   return { swept: true, ...summary };
 }
 
+const ACTIVE_SWEEP_MAX_PAGES = parseInt(process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_MAX_PAGES || "5", 10);
+const ACTIVE_SWEEP_TYPES = (process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_TYPES || "unreachable")
+  .split(",")
+  .map((t) => t.trim())
+  .filter(Boolean);
+
+/**
+ * Lista las alertas ACTIVAS de la organización de los tipos configurados
+ * (por defecto solo `unreachable`) y guarda las que Mongo no conoce, con el
+ * mismo flujo de `ingestActiveAlerts` (redes de estacionamiento, catálogo,
+ * GLPI). Es la garantía de cobertura del webhook: el aviso acelera la
+ * detección, este barrido evita que un corte sin aviso quede invisible.
+ */
+async function processActiveSweep(job: Job) {
+  const orgId = process.env.ORGANIZATION_ID || "";
+  let url: string | null = `https://api.meraki.com/api/v1/organizations/${orgId}/assurance/alerts`;
+  let params: Record<string, any> | undefined = {
+    active: true,
+    types: ACTIVE_SWEEP_TYPES,
+    perPage: 300,
+  };
+  let pages = 0;
+  let listed = 0;
+  const total = { seen: 0, stale_network_skipped: 0, already_known: 0, not_in_catalog: 0, saved: 0 };
+
+  while (url && pages < ACTIVE_SWEEP_MAX_PAGES) {
+    const result = await fetchMerakiPage({ url, method: "GET", params }, "webhook-sweep-active");
+    if (!result || result.status !== 200) {
+      throw new Error(`Meraki no respondió 200 (status=${result?.status ?? "sin respuesta"})`);
+    }
+    pages++;
+    const page: any[] = Array.isArray(result.data) ? result.data : [];
+    listed += page.length;
+    if (page.length > 0) {
+      const r = await glpiValidator.ingestActiveAlerts(page);
+      total.seen += r.seen;
+      total.stale_network_skipped += r.stale_network_skipped;
+      total.already_known += r.already_known;
+      total.not_in_catalog += r.not_in_catalog;
+      total.saved += r.saved;
+    }
+    url = nextPageUrl(result.headers);
+    params = undefined;
+  }
+
+  const summary = { types: ACTIVE_SWEEP_TYPES, pages, listed, truncated: !!url, ...total };
+  await job.log(`Barrido de activas: ${JSON.stringify(summary)}`);
+  log.info("webhook_verify.active_sweep", summary);
+  return { swept: true, ...summary };
+}
+
 export const webhookAlertsWorker = new Worker(
   WEBHOOK_ALERTS_QUEUE_NAME,
   async (job: Job<MerakiWebhookAlertPayload>) => {
@@ -329,6 +381,9 @@ export const webhookAlertsWorker = new Worker(
     }
     if (job.name === SWEEP_RESOLUTIONS_JOB_NAME) {
       return processResolutionSweep(job);
+    }
+    if (job.name === SWEEP_ACTIVE_JOB_NAME) {
+      return processActiveSweep(job);
     }
     const raw = job.data;
     await job.log(

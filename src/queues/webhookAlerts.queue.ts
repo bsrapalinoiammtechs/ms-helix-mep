@@ -188,6 +188,25 @@ export async function enqueueResolutionSweep() {
 }
 
 /**
+ * Barrido de alertas ACTIVAS de la organización: garantiza que una caída que
+ * Assurance levantó llegue a Mongo aunque Meraki nunca haya enviado el
+ * `stopped_reporting` (visto 6-oct-2026: cortes de un solo AP sin ninguna
+ * entrega en el registro de webhooks de Meraki). Una consulta paginada
+ * filtrada por tipo cada N minutos, en vez del polling continuo. Solo con
+ * WEBHOOK_VERIFY_ACTIVE_SWEEP_ENABLED=true. jobId fijo: nunca se solapan.
+ */
+export const SWEEP_ACTIVE_JOB_NAME = "sweep-active";
+
+export async function enqueueActiveSweep() {
+  if (!VERIFY_ENABLED) return;
+  await webhookAlertsQueue.add(SWEEP_ACTIVE_JOB_NAME, {}, {
+    jobId: SWEEP_ACTIVE_JOB_NAME,
+    removeOnComplete: true,
+    removeOnFail: true,
+  });
+}
+
+/**
  * Único reintento de `verify-resolution`: si Assurance todavía no había
  * marcado resuelta alguna alerta cuando se consultó, se vuelve a mirar más
  * tarde. Acotado a un reintento para no dejar consultas en bucle.

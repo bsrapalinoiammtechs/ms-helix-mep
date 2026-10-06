@@ -45,7 +45,7 @@ import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { merakiQueue } from "./queues/meraki.queue";
 import { sendAlertsQueue, enqueueSendAlertsCycle } from "./queues/sendAlerts.queue";
-import { webhookAlertsQueue, enqueueWebhookAlert, enqueueResolutionSweep } from "./queues/webhookAlerts.queue";
+import { webhookAlertsQueue, enqueueWebhookAlert, enqueueResolutionSweep, enqueueActiveSweep } from "./queues/webhookAlerts.queue";
 import { webhookCesesQueue, enqueueWebhookCese } from "./queues/webhookCeses.queue";
 import { epistechWebhookQueue } from "./queues/epistechWebhook.queue";
 import { staleAlertCleanupQueue, enqueueStaleAlertCleanupCycle } from "./queues/staleAlertCleanup.queue";
@@ -90,8 +90,20 @@ cron.schedule("*/1 * * * *", async () => {
 const activeEnabled = process.env.ACTIVE_ENABLED !== "false";
 const ceseEnabled = process.env.CESE_ENABLED !== "false";
 
+// Frecuencia del polling: por defecto la de siempre (1 y 3 min). Se puede
+// espaciar por env para reducir 429 cuando otra instancia (-wh) ya cubre la
+// detección por webhook. Un valor inválido cae al default.
+const resolveCron = (envValue: string | undefined, fallback: string, name: string): string => {
+  if (!envValue) return fallback;
+  if (cron.validate(envValue)) return envValue;
+  log.error("cron.invalid_schedule", { name, value: envValue, using: fallback });
+  return fallback;
+};
+const activeSchedule = resolveCron(process.env.ACTIVE_CRON, "*/1 * * * *", "ACTIVE_CRON");
+const ceseSchedule = resolveCron(process.env.CESE_CRON, "*/3 * * * *", "CESE_CRON");
+
 if (activeEnabled) {
-  cron.schedule("*/1 * * * *", async () => {
+  cron.schedule(activeSchedule, async () => {
      const t0 = Date.now();
      try {
       console.log("---------Active Alerts:----------");
@@ -112,7 +124,7 @@ if (activeEnabled) {
 }
 
 if (ceseEnabled) {
-cron.schedule("*/3 * * * *", async () => {
+cron.schedule(ceseSchedule, async () => {
   const t0 = Date.now();
   try {
     console.log("---------Cece Alerts:----------");
@@ -210,6 +222,29 @@ if (process.env.WEBHOOK_VERIFY_ENABLED === "true") {
       }
     });
     log.info("cron.webhook_sweep.scheduled", { schedule: resolutionSweepSchedule });
+  }
+}
+
+// Barrido de alertas activas de la organización (garantía de cobertura del
+// webhook). Doble interruptor: solo la instancia -wh (WEBHOOK_VERIFY_ENABLED)
+// y solo si se activa explícitamente. Desfasado del barrido de ceses para no
+// pedirle a Meraki las dos listas al mismo minuto.
+const activeSweepSchedule = process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_CRON || "5,15,25,35,45,55 * * * *";
+if (
+  process.env.WEBHOOK_VERIFY_ENABLED === "true" &&
+  process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_ENABLED === "true"
+) {
+  if (!cron.validate(activeSweepSchedule)) {
+    log.error("cron.webhook_active_sweep.invalid_schedule", { schedule: activeSweepSchedule });
+  } else {
+    cron.schedule(activeSweepSchedule, async () => {
+      try {
+        await enqueueActiveSweep();
+      } catch (err: any) {
+        log.error("cron.webhook_active_sweep.error", { message: err?.message });
+      }
+    });
+    log.info("cron.webhook_active_sweep.scheduled", { schedule: activeSweepSchedule });
   }
 }
 
