@@ -128,11 +128,20 @@ const VERIFY_JOB_BY_ALERT_TYPE: Record<string, { name: string; delay: number }> 
   started_reporting: { name: VERIFY_RESOLUTION_JOB_NAME, delay: VERIFY_RESOLUTION_DELAY_MS },
 };
 
+// Interruptores por tipo de job por red (default: encendidos). La API de
+// Assurance admite pocas consultas por minuto en toda la organización
+// (medido 6-oct-2026: ~2 éxitos/min) y las verificaciones por red eran el 64 %
+// del tráfico; los barridos de la organización cubren lo mismo con unas pocas
+// consultas. Apagados, el aviso sigue registrando la red como reciente.
+const VERIFY_NETWORK_JOBS = process.env.WEBHOOK_VERIFY_NETWORK_JOBS !== "false";
+const VERIFY_RESOLUTION_JOBS = process.env.WEBHOOK_VERIFY_RESOLUTION_JOBS !== "false";
+
 async function scheduleNetworkVerification(payload: MerakiWebhookAlertPayload) {
   const target = VERIFY_JOB_BY_ALERT_TYPE[payload.alertType ?? ""];
   if (!VERIFY_ENABLED || !target || !payload.networkId) {
     return;
   }
+  const jobEnabled = target.name === VERIFY_NETWORK_JOB_NAME ? VERIFY_NETWORK_JOBS : VERIFY_RESOLUTION_JOBS;
   // Un fallo acá no debe devolver 500 a Meraki: reintentaría el mismo
   // payload y duplicaría el aviso. El polling sigue cubriendo la alerta.
   try {
@@ -146,6 +155,7 @@ async function scheduleNetworkVerification(payload: MerakiWebhookAlertPayload) {
     if (payload.alertType === "stopped_reporting") {
       await redisConnection.zadd(RECENT_NETWORKS_KEY, Date.now(), payload.networkId);
     }
+    if (!jobEnabled) return;
     // Un job por evento, sin jobId: cada aviso se verifica DESPUÉS de su
     // propio retraso. La agrupación (una sola consulta cuando 10 APs de la
     // misma sede cambian juntos) se hace al ejecutar, con un candado por red.
