@@ -320,7 +320,13 @@ async function processResolutionSweep(job: Job) {
 }
 
 const ACTIVE_SWEEP_MAX_PAGES = parseInt(process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_MAX_PAGES || "5", 10);
-const ACTIVE_SWEEP_TYPES = (process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_TYPES || "unreachable")
+// Cuánto hacia atrás (desde la alerta activa más nueva) se aceptan alertas en
+// el barrido de activas. Un corte nuevo siempre cae dentro de esta ventana.
+const ACTIVE_SWEEP_WINDOW_MS = parseInt(
+  process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_WINDOW_MS || String(24 * 60 * 60 * 1000),
+  10,
+);
+const ACTIVE_SWEEP_TYPES =(process.env.WEBHOOK_VERIFY_ACTIVE_SWEEP_TYPES || "unreachable")
   .split(",")
   .map((t) => t.trim())
   .filter(Boolean);
@@ -342,6 +348,9 @@ async function processActiveSweep(job: Job) {
   };
   let pages = 0;
   let listed = 0;
+  let outsideWindow = 0;
+  let floorMs = -Infinity;
+  let reachedFloor = false;
   const total = { seen: 0, stale_network_skipped: 0, already_known: 0, not_in_catalog: 0, saved: 0 };
 
   while (url && pages < ACTIVE_SWEEP_MAX_PAGES) {
@@ -352,19 +361,47 @@ async function processActiveSweep(job: Job) {
     pages++;
     const page: any[] = Array.isArray(result.data) ? result.data : [];
     listed += page.length;
-    if (page.length > 0) {
-      const r = await glpiValidator.ingestActiveAlerts(page);
+
+    // Meraki devuelve las activas de la más nueva a la más antigua. El piso de
+    // fecha se toma de la más nueva (reloj de Meraki, no el de este servidor):
+    // una caída nueva siempre está arriba, y lo más viejo son alertas que
+    // Meraki dejó abiertas hace días (ya en Helix por otra vía) que no deben
+    // entrar como nuevas.
+    if (pages === 1) {
+      const newestMs = Date.parse(page[0]?.startedAt ?? "");
+      if (!Number.isNaN(newestMs)) floorMs = newestMs - ACTIVE_SWEEP_WINDOW_MS;
+    }
+    const inWindow = page.filter((a) => {
+      const ms = Date.parse(a?.startedAt ?? "");
+      return Number.isNaN(ms) || ms >= floorMs;
+    });
+    outsideWindow += page.length - inWindow.length;
+
+    if (inWindow.length > 0) {
+      const r = await glpiValidator.ingestActiveAlerts(inWindow);
       total.seen += r.seen;
       total.stale_network_skipped += r.stale_network_skipped;
       total.already_known += r.already_known;
       total.not_in_catalog += r.not_in_catalog;
       total.saved += r.saved;
     }
+    if (inWindow.length < page.length) {
+      reachedFloor = true;
+      break;
+    }
     url = nextPageUrl(result.headers);
     params = undefined;
   }
 
-  const summary = { types: ACTIVE_SWEEP_TYPES, pages, listed, truncated: !!url, ...total };
+  const summary = {
+    types: ACTIVE_SWEEP_TYPES,
+    window_h: ACTIVE_SWEEP_WINDOW_MS / 3600000,
+    pages,
+    listed,
+    outside_window: outsideWindow,
+    truncated: !reachedFloor && !!url,
+    ...total,
+  };
   await job.log(`Barrido de activas: ${JSON.stringify(summary)}`);
   log.info("webhook_verify.active_sweep", summary);
   return { swept: true, ...summary };
