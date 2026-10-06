@@ -198,6 +198,29 @@ function getSilentRule(): { types: string[]; fromMs: number } | null {
 }
 
 /**
+ * Silencio de CESES hacia Helix: TCP_SILENT_CESE_TYPES (lista) +
+ * TCP_SILENT_CESE_BEFORE (ISO, hora de ESTE servidor). El cese de una alerta
+ * de esos tipos CREADA antes de esa fecha no se envía a Helix (sí a Epistech,
+ * que es idempotente por alert_id). Para la instancia -wh: las alertas
+ * anteriores al corte las gestiona producción, y Helix identifica la alarma
+ * por nombre de equipo, así que un cese repetido que llegue tarde podría
+ * cerrar una alarma NUEVA del mismo equipo. Sin ambas variables válidas no
+ * se silencia nada.
+ */
+function getSilentCeseRule(): { types: string[]; beforeMs: number } | null {
+  const types = parseAlertTypes(process.env.TCP_SILENT_CESE_TYPES);
+  if (!types) return null;
+  const beforeMs = Date.parse(process.env.TCP_SILENT_CESE_BEFORE || "");
+  if (Number.isNaN(beforeMs)) {
+    log.error("send.silent_cese.invalid_before", {
+      message: "TCP_SILENT_CESE_TYPES definido sin TCP_SILENT_CESE_BEFORE válido (ISO) -- no se silencia nada",
+    });
+    return null;
+  }
+  return { types, beforeMs };
+}
+
+/**
  * `job` es opcional -- si viene (llamado desde sendAlerts.worker.ts), cada
  * paso queda registrado en `job.log()` y visible en la pestaña Logs de
  * bull-board. A diferencia de antes, si algo falla acá el error se
@@ -260,6 +283,28 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
 
     const payloads: IAlertHelix[] = built.map((b) => b.payload);
 
+    // Ceses que NO deben ir a Helix (ver getSilentCeseRule): siguen a
+    // Epistech y se marcan como enviados igual, solo se omiten del envío TCP.
+    const ceseRule = getSilentCeseRule();
+    const tcpSkipIds = new Set(
+      ceseRule
+        ? alertsFiltered
+            .filter(
+              (a) =>
+                a.resolvedAt !== null &&
+                a.resolvedAt !== undefined &&
+                ceseRule.types.includes(a.type) &&
+                new Date((a as any).createdAt).getTime() < ceseRule.beforeMs,
+            )
+            .map((a) => a.alertId)
+        : [],
+    );
+    const tcpPayloads: IAlertHelix[] = payloads.filter((p) => !tcpSkipIds.has(p.alertId));
+    const tcpSkippedCese = payloads.length - tcpPayloads.length;
+    if (tcpSkippedCese > 0) {
+      await job?.log(`Ceses omitidos del envío a Helix (TCP_SILENT_CESE_*): ${tcpSkippedCese}`);
+    }
+
     // Envío a EPISTECH (mismo payload, caídas + ceses juntos) -- va ANTES
     // del envío a TCP a propósito: `sendAlertsToTcp` relanza su error si
     // ms-helix-tcp está caído, y eso corta esta función; si Epistech se
@@ -289,9 +334,10 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
     // instancia de producción -- ahí las alertas dejarían de llegar a
     // Helix quedando marcadas como enviadas.
     const tcpEnabled = process.env.TCP_ENABLED !== "false";
-    const emitAlertsToHelix: { success: number; failed: number } = tcpEnabled
-      ? await sendAlertsToTcp(payloads)
-      : { success: payloads.length, failed: 0 };
+    const emitAlertsToHelix: { success: number; failed: number } =
+      tcpEnabled && tcpPayloads.length > 0
+        ? await sendAlertsToTcp(tcpPayloads)
+        : { success: tcpPayloads.length, failed: 0 };
     if (!tcpEnabled) {
       await job?.log("TCP_ENABLED=false: no se envía a ms-helix-tcp (instancia solo-Epistech).");
     }
@@ -324,6 +370,7 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
       received: alertsFiltered.length,
       built: built.length,
       silenced,
+      tcp_skipped_cese: tcpSkippedCese,
       tcp_success: emitAlertsToHelix.success,
       tcp_failed: emitAlertsToHelix.failed,
       claimed,
