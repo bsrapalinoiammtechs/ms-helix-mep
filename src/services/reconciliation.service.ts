@@ -64,6 +64,7 @@ class ReconciliationService {
   private readonly forceLookupEnabled: boolean;
   private readonly forceLookupStuckDays: number;
   private readonly forceLookupMaxPerRun: number;
+  private readonly forceFirst: boolean;
 
   constructor(overrides?: {
     maxAgeDays?: number;
@@ -112,6 +113,12 @@ class ReconciliationService {
     this.forceLookupMaxPerRun =
       overrides?.forceLookupMaxPerRun ??
       parseInt(process.env.RECONCILIATION_FORCE_LOOKUP_MAX_PER_RUN || "100", 10);
+    // Por defecto la pasada por ID corre ANTES del barrido por red: el barrido
+    // por red pagina la lista de resueltas red por red (con 70 redes dura horas
+    // y compite por el límite de la API), así que la pasada por ID, barata y
+    // definitiva, no llegaba a correr y las alertas retenidas se quedaban
+    // abiertas en Helix. RECONCILIATION_FORCE_FIRST=false restaura el orden anterior.
+    this.forceFirst = process.env.RECONCILIATION_FORCE_FIRST !== "false";
   }
 
   async run(): Promise<ReconciliationSummary | undefined> {
@@ -140,6 +147,9 @@ class ReconciliationService {
     const matchedAlerts: ReconciliationSummary["matchedAlerts"] = [];
 
     try {
+      const earlyForceLookup = this.forceFirst
+        ? await this.forceResolveStuckAlertsByIdLookup()
+        : undefined;
       const stuckCutoff = new Date(Date.now() - this.stuckHours * 3600 * 1000).toISOString();
       const ageCutoff = new Date(Date.now() - this.maxAgeDays * 24 * 3600 * 1000).toISOString();
 
@@ -163,7 +173,7 @@ class ReconciliationService {
       });
 
       if (inScope.length === 0) {
-        const forceLookup = await this.forceResolveStuckAlertsByIdLookup();
+        const forceLookup = earlyForceLookup ?? (await this.forceResolveStuckAlertsByIdLookup());
         log.info("reconciliation.cycle.empty", { ms: Date.now() - t0 });
         await recordSync("cisco_reconciliation", {
           metadata: {
@@ -310,7 +320,7 @@ class ReconciliationService {
         if (i < networks.length - 1) await sleep(this.rateDelayMs);
       }
 
-      const forceLookup = await this.forceResolveStuckAlertsByIdLookup();
+      const forceLookup = earlyForceLookup ?? (await this.forceResolveStuckAlertsByIdLookup());
 
       log.info("reconciliation.cycle.summary", {
         ms: Date.now() - t0,
@@ -477,7 +487,10 @@ class ReconciliationService {
       isGlpi: true,
       startedAt: { $lt: cutoff },
     })
-      .sort({ startedAt: 1 })
+      // Rotación: primero las que nunca se consultaron o se consultaron hace
+      // más (lastLookupAt ausente va primero). Sin esto, las ~100 alertas más
+      // viejas que siguen realmente activas ocupaban siempre el mismo cupo.
+      .sort({ lastLookupAt: 1, startedAt: 1 })
       .limit(this.forceLookupMaxPerRun)
       .lean<StuckAlert[]>();
 
@@ -499,6 +512,7 @@ class ReconciliationService {
     let resolvedStaleNetwork = 0;
     let stillActive = 0;
     let errors = 0;
+    const stillActiveIds: string[] = [];
 
     for (const r of results) {
       if (r.estado === "ERROR") {
@@ -518,6 +532,7 @@ class ReconciliationService {
 
       if (r.estado === "ACTIVA" && !isStaleNetwork) {
         stillActive++;
+        stillActiveIds.push(r.alertId);
         continue;
       }
 
@@ -555,6 +570,17 @@ class ReconciliationService {
           alertId: r.alertId,
           message: e?.message,
         });
+      }
+    }
+
+    if (!this.dryRun && stillActiveIds.length > 0) {
+      try {
+        await Alert.updateMany(
+          { alertId: { $in: stillActiveIds } },
+          { $set: { lastLookupAt: new Date() } },
+        );
+      } catch (e: any) {
+        log.warn("reconciliation.force_lookup.mark_active.error", { message: e?.message });
       }
     }
 

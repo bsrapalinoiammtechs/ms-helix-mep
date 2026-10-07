@@ -26,6 +26,9 @@ interface IAlert extends Document {
   // one-off de Fase E) -- ver 01_FIX_ALERTAS_RETENIDAS...md, sección FASE E.
   resolvedVia?: string;
   reconciledAt?: Date;
+  // Último lookup individual (por ID) que la encontró todavía activa en
+  // Meraki -- sirve para rotar los candidatos de la conciliación.
+  lastLookupAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -90,6 +93,7 @@ const alertSchema = new Schema<IAlert>(
     // igual que pasó antes con `sentAt` (ver 01_FIX_ALERTAS_RETENIDAS...md).
     resolvedVia: { type: String, required: false },
     reconciledAt: { type: Date, required: false },
+    lastLookupAt: { type: Date, required: false },
   },
   { timestamps: true } // Habilita `createdAt` y `updatedAt`
 );
