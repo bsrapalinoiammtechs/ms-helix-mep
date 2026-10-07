@@ -62,18 +62,35 @@ async function lookupOne(organizationId: string, alertId: string): Promise<Alert
   };
 }
 
-// Se dispara todo con Promise.all a propósito -- los jobs se encolan de
-// inmediato, pero concurrency:1 en el worker igual los va a procesar uno
-// por uno respetando MERAKI_RATE_DELAY_MS. Con muchos ids esto tarda: N
-// alertas * MERAKI_RATE_DELAY_MS (11s default) -- ej. 85 ids ~= 15 min. Es
-// una herramienta de diagnóstico puntual, no un endpoint de alta
-// frecuencia, así que se prioriza no romper el rate-limit por sobre la
-// latencia de la respuesta.
+// Cuántas consultas van en vuelo a la vez. El worker del gateway atiende una
+// por MERAKI_RATE_DELAY_MS, y el cliente espera su turno como máximo
+// MERAKI_JOB_WAIT_TIMEOUT_MS (10 min). Encolar todo de golpe hacía que, con 60
+// ids y 30 s por consulta, solo 20 terminaran a tiempo: las otras 40 se daban
+// por fallidas pero sus jobs seguían en la cola, gastando consultas y
+// bloqueando a los pollers. Con una ventana pequeña ninguna espera más de
+// LOOKUP_CONCURRENCY * MERAKI_RATE_DELAY_MS, y el resto del tráfico se
+// intercala entre ellas.
+const LOOKUP_CONCURRENCY = Math.max(1, parseInt(process.env.ALERT_LOOKUP_CONCURRENCY || "3", 10));
+
+async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i] as T);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 export async function lookupAlerts(organizationId: string, alertIds: string[]): Promise<AlertLookupResult[]> {
   const uniqueIds = Array.from(new Set(alertIds.map((id) => String(id).trim()).filter(Boolean)));
-  log.info("alert_lookup.start", { organizationId, count: uniqueIds.length });
+  log.info("alert_lookup.start", { organizationId, count: uniqueIds.length, concurrency: LOOKUP_CONCURRENCY });
 
-  const results = await Promise.all(uniqueIds.map((id) => lookupOne(organizationId, id)));
+  const results = await mapWithLimit(uniqueIds, LOOKUP_CONCURRENCY, (id) => lookupOne(organizationId, id));
 
   log.info("alert_lookup.done", {
     organizationId,
