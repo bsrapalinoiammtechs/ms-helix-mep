@@ -184,7 +184,7 @@ interface IBuiltAlert {
  * cese de una alerta silenciada también queda silenciado. Sin
  * TCP_SILENT_FROM válido no se silencia nada (falla hacia enviar).
  */
-function getSilentRule(): { types: string[]; fromMs: number } | null {
+function getSilentRule(): { types: string[]; fromMs: number; keepCese: boolean } | null {
   const types = parseAlertTypes(process.env.TCP_SILENT_TYPES);
   if (!types) return null;
   const fromMs = Date.parse(process.env.TCP_SILENT_FROM || "");
@@ -194,7 +194,12 @@ function getSilentRule(): { types: string[]; fromMs: number } | null {
     });
     return null;
   }
-  return { types, fromMs };
+  // TCP_SILENT_KEEP_CESE=true: se silencia la ALARMA pero el CESE sí se envía.
+  // Reparto de funciones entre instancias: una detecta y envía la alarma, la
+  // otra (la que tiene el cese al día) envía el cese. Helix cierra TODAS las
+  // alarmas del equipo con un solo cese, así que el cese debe salir una vez y
+  // desde quien lo ve de forma fiable.
+  return { types, fromMs, keepCese: process.env.TCP_SILENT_KEEP_CESE === "true" };
 }
 
 /**
@@ -245,7 +250,9 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
             .filter(
               (a) =>
                 silentRule.types.includes(a.type) &&
-                new Date((a as any).createdAt).getTime() >= silentRule.fromMs,
+                new Date((a as any).createdAt).getTime() >= silentRule.fromMs &&
+                // Con keepCese, un pendiente ya resuelto (el cese) NO se silencia.
+                !(silentRule.keepCese && a.resolvedAt !== null && a.resolvedAt !== undefined),
             )
             .map((a) => a.alertId)
         : [],
