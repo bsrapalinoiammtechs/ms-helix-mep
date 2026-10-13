@@ -27,13 +27,22 @@ Uso:
   python3 limpiar_colgadas_wh.py paso2 [--aplicar]
   python3 limpiar_colgadas_wh.py paso3 [--aplicar]
 Respaldo del estado previo en /tmp/limpieza_<paso>_respaldo.json.
+
+REPETIBILIDAD: paso2 y paso3 son repetibles. paso1 NO: al aplicarse, el cese queda
+igual que antes (isTcp:true) y el sistema no guarda cuándo se envió, así que la
+prueba seguirá diciendo que "re-marcaría" lo mismo. Por eso deja una marca en
+/tmp/limpieza_paso1_aplicado y se niega a volver a correr (usar --forzar solo si
+se sabe que los ceses NO salieron).
 """
+import datetime
 import json
+import os
 import subprocess
 import sys
 
 M3 = ("mongodb-helix-mep", "ms_helix_mep", "ms-helix-mep")
 WH = ("mongodb-helix-mep-wh", "ms_helix_mep-wh", "ms-helix-mep-wh")
+MARCA_PASO1 = "/tmp/limpieza_paso1_aplicado"
 CERRABLES = "/tmp/cese_cerrables.json"
 VIGENTES = "/tmp/alarmas_a_reenviar.json"
 APLICAR = "--aplicar" in sys.argv
@@ -71,6 +80,10 @@ def abortar(msg):
 
 
 def paso1():
+    if os.path.exists(MARCA_PASO1) and "--forzar" not in sys.argv:
+        abortar(f"el paso1 YA SE APLICÓ ({open(MARCA_PASO1).read().strip()}). Volver a aplicarlo "
+                "reenviaría los ceses (duplicados) y cada cese cierra TODAS las alarmas del equipo. "
+                "Usa --forzar solo si los ceses NO salieron.")
     if env(M3, "TCP_SILENT_KEEP_CESE") != "true":
         abortar("mep3 no tiene TCP_SILENT_KEEP_CESE=true (hace falta para que el cese salga)")
     desde = env(M3, "TCP_SILENT_FROM")
@@ -87,7 +100,9 @@ def paso1():
     resp = mongo(M3, pre + f'print(JSON.stringify(db.alerts.find({filtro},{{_id:0,alertId:1,isTcp:1}}).toArray()))')
     open("/tmp/limpieza_paso1_respaldo.json", "w").write(resp)
     mod = mongo(M3, pre + f"print(db.alerts.updateMany({filtro},{{$set:{{isTcp:false}}}}).modifiedCount)").strip()
+    open(MARCA_PASO1, "w").write(f"{datetime.datetime.now().isoformat(timespec='seconds')} re-marcadas={mod}")
     print(f"paso1: re-marcadas como pendientes en mep3: {mod}. Se enviarán en el próximo ciclo (1 min).")
+    print(f"paso1: marca de aplicado guardada en {MARCA_PASO1} (no se puede volver a aplicar).")
 
 
 def paso2():
