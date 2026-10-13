@@ -26,6 +26,7 @@ Uso (en el servidor):
 Respaldo de lo insertado: /tmp/migracion_estado_insertados.json
 """
 import json
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -38,12 +39,20 @@ REVERTIR = "--revertir" in sys.argv
 
 
 def mongo(inst, js):
-    """Ejecuta JS en mongosh de esa instancia; el script viaja por stdin (sin límite de argumentos)."""
+    """Ejecuta JS en mongosh de esa instancia con --file (sin indicador interactivo).
+    El script se escribe dentro del contenedor por stdin, así no hay límite de argumentos."""
     cont, db, _ = inst
-    p = subprocess.run(
-        ["docker", "exec", "-i", cont, "mongosh", f"mongodb://andrair:1234@localhost:27017/{db}?authSource=admin", "--quiet"],
-        input=js, capture_output=True, text=True,
-    )
+    ruta = "/tmp/_migracion_estado.js"
+    w = subprocess.run(["docker", "exec", "-i", cont, "sh", "-c", f"cat > {ruta}"], input=js, capture_output=True, text=True)
+    if w.returncode != 0:
+        sys.exit(f"ERROR escribiendo el script en {cont}: {w.stderr[:300]}")
+    try:
+        p = subprocess.run(
+            ["docker", "exec", cont, "mongosh", f"mongodb://andrair:1234@localhost:27017/{db}?authSource=admin", "--quiet", "--file", ruta],
+            capture_output=True, text=True,
+        )
+    finally:
+        subprocess.run(["docker", "exec", cont, "rm", "-f", ruta], capture_output=True)
     if p.returncode != 0:
         sys.exit(f"ERROR ejecutando en {cont}: {p.stderr[:300]}")
     return p.stdout
@@ -52,7 +61,7 @@ def mongo(inst, js):
 def ultima_salida(out):
     """Última línea que parece salida de datos (JSON o número); mongosh por stdin puede añadir líneas sueltas."""
     for linea in reversed(out.strip().splitlines()):
-        l = linea.strip()
+        l = re.sub(r"^[\w.\-]+>\s*", "", linea.strip())
         if l and (l[0] in "[{" or l.isdigit()):
             return l
     sys.exit(f"ERROR: no se encontró salida utilizable de mongosh: {out[-300:]}")
