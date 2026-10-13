@@ -207,6 +207,23 @@ export async function enqueueResolutionSweep() {
  */
 export const SWEEP_ACTIVE_JOB_NAME = "sweep-active";
 
+/**
+ * Sincronización de cierres desde la base de la instancia de polling (ver
+ * services/closureSync.service.ts): cierra en -wh lo que mep3 ya cerró, sin
+ * llamar a la API de Meraki. Solo con CLOSURE_SYNC_ENABLED=true. jobId fijo:
+ * nunca se solapan dos corridas.
+ */
+export const CLOSURE_SYNC_JOB_NAME = "closure-sync";
+
+export async function enqueueClosureSync() {
+  if (process.env.CLOSURE_SYNC_ENABLED !== "true") return;
+  await webhookAlertsQueue.add(CLOSURE_SYNC_JOB_NAME, {}, {
+    jobId: CLOSURE_SYNC_JOB_NAME,
+    removeOnComplete: true,
+    removeOnFail: true,
+  });
+}
+
 export async function enqueueActiveSweep() {
   if (!VERIFY_ENABLED) return;
   await webhookAlertsQueue.add(SWEEP_ACTIVE_JOB_NAME, {}, {

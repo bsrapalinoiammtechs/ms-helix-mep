@@ -6,6 +6,7 @@ import {
   VERIFY_RESOLUTION_JOB_NAME,
   SWEEP_RESOLUTIONS_JOB_NAME,
   SWEEP_ACTIVE_JOB_NAME,
+  CLOSURE_SYNC_JOB_NAME,
   RECENT_NETWORKS_KEY,
   VerifyNetworkJobData,
   scheduleResolutionRetry,
@@ -15,6 +16,7 @@ import { MerakiWebhookAlertPayload } from "../interfaces/IMerakiWebhookAlert";
 import { mapMerakiWebhookAlert } from "../functions/mapMerakiWebhookAlert";
 import CatalogService from "../services/catalog.service";
 import ActiveAlertsService from "../services/active.alerts.service";
+import { runClosureSync } from "../services/closureSync.service";
 import {
   saveAlert,
   handleReactivation,
@@ -407,6 +409,17 @@ async function processActiveSweep(job: Job) {
   return { swept: true, ...summary };
 }
 
+/**
+ * Cierra en esta instancia lo que la instancia de polling ya tiene cerrado
+ * (services/closureSync.service.ts). No toca la API de Meraki.
+ */
+async function processClosureSync(job: Job) {
+  const summary = await runClosureSync();
+  await job.log(`Sincronización de cierres: ${JSON.stringify(summary)}`);
+  if (!("skipped" in summary)) log.info("webhook_verify.closure_sync", summary as unknown as Record<string, unknown>);
+  return summary;
+}
+
 export const webhookAlertsWorker = new Worker(
   WEBHOOK_ALERTS_QUEUE_NAME,
   async (job: Job<MerakiWebhookAlertPayload>) => {
@@ -421,6 +434,9 @@ export const webhookAlertsWorker = new Worker(
     }
     if (job.name === SWEEP_ACTIVE_JOB_NAME) {
       return processActiveSweep(job);
+    }
+    if (job.name === CLOSURE_SYNC_JOB_NAME) {
+      return processClosureSync(job);
     }
     const raw = job.data;
     await job.log(

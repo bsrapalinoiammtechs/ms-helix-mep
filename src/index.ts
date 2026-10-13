@@ -45,7 +45,7 @@ import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { merakiQueue } from "./queues/meraki.queue";
 import { sendAlertsQueue, enqueueSendAlertsCycle } from "./queues/sendAlerts.queue";
-import { webhookAlertsQueue, enqueueWebhookAlert, enqueueResolutionSweep, enqueueActiveSweep } from "./queues/webhookAlerts.queue";
+import { webhookAlertsQueue, enqueueWebhookAlert, enqueueResolutionSweep, enqueueActiveSweep, enqueueClosureSync } from "./queues/webhookAlerts.queue";
 import { webhookCesesQueue, enqueueWebhookCese } from "./queues/webhookCeses.queue";
 import { epistechWebhookQueue } from "./queues/epistechWebhook.queue";
 import { staleAlertCleanupQueue, enqueueStaleAlertCleanupCycle } from "./queues/staleAlertCleanup.queue";
@@ -212,7 +212,10 @@ if (staleCleanupEnabled) {
 // queues/webhookAlerts.queue.ts. Encola un job con jobId fijo, así que dos
 // barridos nunca se solapan, y no consulta a Meraki si no hay nada abierto.
 const resolutionSweepSchedule = process.env.WEBHOOK_VERIFY_SWEEP_CRON || "*/10 * * * *";
-if (process.env.WEBHOOK_VERIFY_ENABLED === "true") {
+// WEBHOOK_VERIFY_SWEEP_ENABLED=false apaga este barrido (p. ej. cuando los
+// cierres se toman de la base de mep3 con CLOSURE_SYNC_ENABLED y no hace falta
+// gastar peticiones de la API en lo mismo).
+if (process.env.WEBHOOK_VERIFY_ENABLED === "true" && process.env.WEBHOOK_VERIFY_SWEEP_ENABLED !== "false") {
   if (!cron.validate(resolutionSweepSchedule)) {
     log.error("cron.webhook_sweep.invalid_schedule", { schedule: resolutionSweepSchedule });
   } else {
@@ -247,6 +250,24 @@ if (
       }
     });
     log.info("cron.webhook_active_sweep.scheduled", { schedule: activeSweepSchedule });
+  }
+}
+
+// Sincronización de cierres desde la base de la instancia de polling (mep3):
+// cero llamadas a la API de Meraki. Solo con CLOSURE_SYNC_ENABLED=true.
+const closureSyncSchedule = process.env.CLOSURE_SYNC_CRON || "*/5 * * * *";
+if (process.env.CLOSURE_SYNC_ENABLED === "true") {
+  if (!cron.validate(closureSyncSchedule)) {
+    log.error("cron.closure_sync.invalid_schedule", { schedule: closureSyncSchedule });
+  } else {
+    cron.schedule(closureSyncSchedule, async () => {
+      try {
+        await enqueueClosureSync();
+      } catch (err: any) {
+        log.error("cron.closure_sync.error", { message: err?.message });
+      }
+    });
+    log.info("cron.closure_sync.scheduled", { schedule: closureSyncSchedule });
   }
 }
 
