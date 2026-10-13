@@ -1,10 +1,7 @@
 import { Job } from "bullmq";
 import { IAlert } from "../interfaces/IAlert";
 import { IAlertCisco } from "../interfaces/IAlertCisco";
-import {
-  getListOfActiveAlerts,
-  getListOfResolvedAlerts,
-} from "../services/CiscoMerakiAPIService";
+import { getListOfActiveAlerts, getListOfResolvedAlerts } from "../services/CiscoMerakiAPIService";
 import {
   getPendingAlertsForSend,
   saveAlert,
@@ -14,11 +11,7 @@ import {
 } from "../services/MongoDBService";
 import { format } from "date-fns";
 import { toZonedTime } from "date-fns-tz";
-import {
-  getNetworkData,
-  getNetworkId,
-  getSessionToken,
-} from "../services/GlpiAPIService";
+import { getNetworkData, getNetworkId, getSessionToken } from "../services/GlpiAPIService";
 import { INetworkGlpi } from "../interfaces/INetworkGlpiResponse";
 import { DescriptionEnum } from "../enums/DescriptionEnum";
 import { IAlertHelix } from "../interfaces/IAlertHelix";
@@ -30,12 +23,16 @@ import { enqueueEpistechAlerts } from "../queues/epistechWebhook.queue";
 import CatalogService from "../services/catalog.service";
 import { log } from "../utils/logger";
 import lodash from "lodash";
+import { armarDescripcion } from "../utils/descripcion";
 
 export const getAndSaveActiveAlerts = async () => {
   const organizationId: string = process.env.ORGANIZATION_ID || "";
   const organizationName: string = process.env.ORGANIZATION_NAME || "";
   try {
-    console.log("SAA: Obteniendo alertas activas para procesar su guardado: ", new Date(Date.now()).toLocaleString('es-CO'));
+    console.log(
+      "SAA: Obteniendo alertas activas para procesar su guardado: ",
+      new Date(Date.now()).toLocaleString("es-CO")
+    );
     const ciscoAlerts: IAlertCisco[] = await getListOfActiveAlerts();
     console.log("SAA: Cantidad de alertas cisco para procesar: ", ciscoAlerts?.length);
     type IAlertCiscoGlpi = IAlertCisco & {
@@ -60,9 +57,7 @@ export const getAndSaveActiveAlerts = async () => {
           isGlpi: boolean;
           comment: string;
           location: string;
-        } = await validateDeviceNameInGlpi(
-          lodash.defaultTo(alertCisco.scope.devices[0].name, "")
-        );
+        } = await validateDeviceNameInGlpi(lodash.defaultTo(alertCisco.scope.devices[0].name, ""));
         if (validationGlpi.isGlpi) {
           validateAlerts.push({
             ...alertCisco,
@@ -73,10 +68,7 @@ export const getAndSaveActiveAlerts = async () => {
           });
         }
       } catch (error) {
-        console.warn(
-          `No se pudo validar el dispositivo: ${alertCisco.scope.devices[0].name}`,
-          error
-        );
+        console.warn(`No se pudo validar el dispositivo: ${alertCisco.scope.devices[0].name}`, error);
       }
     }
     if (skippedNotInCatalog > 0) {
@@ -86,34 +78,32 @@ export const getAndSaveActiveAlerts = async () => {
       });
     }
 
-    const savePromises = validateAlerts.map(
-      async (alertValidate: IAlertCiscoGlpi) => {
-        const alertToSave: IAlert = {
-          alertId: alertValidate.id,
-          organization: {
-            id: organizationId,
-            name: organizationName,
-          },
-          categoryType: alertValidate.categoryType,
-          network: alertValidate.network,
-          startedAt: alertValidate.startedAt,
-          dismissedAt: alertValidate.dismissedAt,
-          resolvedAt: alertValidate.resolvedAt,
-          deviceType: alertValidate.deviceType,
-          type: alertValidate.type,
-          title: alertValidate.title,
-          description: alertValidate.description || "",
-          severity: alertValidate.severity,
-          scope: alertValidate.scope,
-          descriptionGlpi: alertValidate.descriptionGlpi,
-          isGlpi: alertValidate.isGlpi,
-          comment: alertValidate.comment || "",
-          isTcp: false,
-          location: alertValidate.location,
-        };
-        await saveAlert(alertToSave);
-      }
-    );
+    const savePromises = validateAlerts.map(async (alertValidate: IAlertCiscoGlpi) => {
+      const alertToSave: IAlert = {
+        alertId: alertValidate.id,
+        organization: {
+          id: organizationId,
+          name: organizationName,
+        },
+        categoryType: alertValidate.categoryType,
+        network: alertValidate.network,
+        startedAt: alertValidate.startedAt,
+        dismissedAt: alertValidate.dismissedAt,
+        resolvedAt: alertValidate.resolvedAt,
+        deviceType: alertValidate.deviceType,
+        type: alertValidate.type,
+        title: alertValidate.title,
+        description: alertValidate.description || "",
+        severity: alertValidate.severity,
+        scope: alertValidate.scope,
+        descriptionGlpi: alertValidate.descriptionGlpi,
+        isGlpi: alertValidate.isGlpi,
+        comment: alertValidate.comment || "",
+        isTcp: false,
+        location: alertValidate.location,
+      };
+      await saveAlert(alertToSave);
+    });
 
     await Promise.all(savePromises);
     console.log(`SAA: ${validateAlerts.length} alertas de cisco validas procesadas`);
@@ -132,15 +122,9 @@ const validateDeviceNameInGlpi = async (
 }> => {
   try {
     const sessionToken: string = await getSessionToken();
-    const networkId: { match: boolean; id: string } = await getNetworkId(
-      nameDevice,
-      sessionToken
-    );
+    const networkId: { match: boolean; id: string } = await getNetworkId(nameDevice, sessionToken);
     if (networkId.match) {
-      const networkData: INetworkGlpi = await getNetworkData(
-        networkId.id,
-        sessionToken
-      );
+      const networkData: INetworkGlpi = await getNetworkData(networkId.id, sessionToken);
       return {
         descriptionGlpi: networkData.sysdescr,
         isGlpi: true,
@@ -236,7 +220,11 @@ function getSilentCeseRule(): { types: string[]; beforeMs: number } | null {
 export const validateAndBuildAlertsToSend = async (job?: Job) => {
   try {
     const alertsFiltered: IAlert[] = await getPendingAlertsForSend(1000);
-    console.log("Cantidad de alertas pendientes: ", alertsFiltered?.length, new Date(Date.now()).toLocaleString('es-CO'));
+    console.log(
+      "Cantidad de alertas pendientes: ",
+      alertsFiltered?.length,
+      new Date(Date.now()).toLocaleString("es-CO")
+    );
     await job?.log(`Alertas pendientes de envío encontradas en Mongo: ${alertsFiltered?.length ?? 0}`);
 
     const builtAll: IBuiltAlert[] = await buildAlertsForHelix(alertsFiltered);
@@ -252,26 +240,28 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
                 silentRule.types.includes(a.type) &&
                 new Date((a as any).createdAt).getTime() >= silentRule.fromMs &&
                 // Con keepCese, un pendiente ya resuelto (el cese) NO se silencia.
-                !(silentRule.keepCese && a.resolvedAt !== null && a.resolvedAt !== undefined),
+                !(silentRule.keepCese && a.resolvedAt !== null && a.resolvedAt !== undefined)
             )
             .map((a) => a.alertId)
-        : [],
+        : []
     );
     const silentBuilt = builtAll.filter((b) => silentIds.has(b.payload.alertId));
     const built: IBuiltAlert[] = builtAll.filter((b) => !silentIds.has(b.payload.alertId));
     let silenced = 0;
     if (silentBuilt.length > 0) {
       const silentClaims = await Promise.allSettled(
-        silentBuilt.map(async (b) => (await setIsTCpAlert(b.payload.alertId, b.expectedResolvedAt)) !== null),
+        silentBuilt.map(async (b) => (await setIsTCpAlert(b.payload.alertId, b.expectedResolvedAt)) !== null)
       );
       silenced = silentClaims.filter((r) => r.status === "fulfilled" && r.value).length;
       await job?.log(
-        `Silenciadas (TCP_SILENT_TYPES=${process.env.TCP_SILENT_TYPES}): ${silenced} de ${silentBuilt.length} -- marcadas como enviadas sin enviar a Helix ni a Epistech.`,
+        `Silenciadas (TCP_SILENT_TYPES=${process.env.TCP_SILENT_TYPES}): ${silenced} de ${silentBuilt.length} -- marcadas como enviadas sin enviar a Helix ni a Epistech.`
       );
     }
 
-    console.log("Alertas a enviar: ", built.length, new Date(Date.now()).toLocaleString('es-CO'));
-    await job?.log(`Alertas con regla de catálogo, listas para Helix: ${built.length} de ${alertsFiltered.length} pendientes (silenciadas: ${silenced})`);
+    console.log("Alertas a enviar: ", built.length, new Date(Date.now()).toLocaleString("es-CO"));
+    await job?.log(
+      `Alertas con regla de catálogo, listas para Helix: ${built.length} de ${alertsFiltered.length} pendientes (silenciadas: ${silenced})`
+    );
 
     if (built.length === 0) {
       await job?.log("Nada que enviar en este ciclo -- termina aquí");
@@ -301,10 +291,10 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
                 a.resolvedAt !== null &&
                 a.resolvedAt !== undefined &&
                 ceseRule.types.includes(a.type) &&
-                new Date((a as any).createdAt).getTime() < ceseRule.beforeMs,
+                new Date((a as any).createdAt).getTime() < ceseRule.beforeMs
             )
             .map((a) => a.alertId)
-        : [],
+        : []
     );
     const tcpPayloads: IAlertHelix[] = payloads.filter((p) => !tcpSkipIds.has(p.alertId));
     const tcpSkippedCese = payloads.length - tcpPayloads.length;
@@ -348,7 +338,10 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
     if (!tcpEnabled) {
       await job?.log("TCP_ENABLED=false: no se envía a ms-helix-tcp (instancia solo-Epistech).");
     }
-    console.log(`Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`, new Date(Date.now()).toLocaleString('es-CO'));
+    console.log(
+      `Resultado del envío a TCP: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`,
+      new Date(Date.now()).toLocaleString("es-CO")
+    );
     await job?.log(`Envío a ms-helix-tcp: ${emitAlertsToHelix.success} exitosos, ${emitAlertsToHelix.failed} fallidos`);
 
     let claimed = 0;
@@ -364,9 +357,13 @@ export const validateAndBuildAlertsToSend = async (job?: Job) => {
         if (r.status === "fulfilled" && r.value) claimed++;
         else raceLost++;
       }
-      await job?.log(`Marcadas como enviadas en Mongo: ${claimed}${raceLost > 0 ? ` (perdidas por condición de carrera: ${raceLost})` : ""}`);
+      await job?.log(
+        `Marcadas como enviadas en Mongo: ${claimed}${raceLost > 0 ? ` (perdidas por condición de carrera: ${raceLost})` : ""}`
+      );
     } else {
-      await job?.log(`TCP tuvo fallos (${emitAlertsToHelix.failed}) -- no se marca nada como enviado, se reintentará en el próximo ciclo`);
+      await job?.log(
+        `TCP tuvo fallos (${emitAlertsToHelix.failed}) -- no se marca nada como enviado, se reintentará en el próximo ciclo`
+      );
       log.warn("send.cron.tcp_failed.skipping_claim", {
         failed: emitAlertsToHelix.failed,
         success: emitAlertsToHelix.success,
@@ -401,10 +398,7 @@ async function buildAlertsForHelix(alerts: IAlert[]): Promise<IBuiltAlert[]> {
   let skippedNotInCatalog = 0;
   for (const alert of alerts) {
     try {
-      const rule = await CatalogService.getRule(
-        alert.type,
-        alert.scope.devices[0].productType
-      );
+      const rule = await CatalogService.getRule(alert.type, alert.scope.devices[0].productType);
 
       if (rule) {
         const isCese = !lodash.isNull(alert.resolvedAt);
@@ -413,17 +407,13 @@ async function buildAlertsForHelix(alerts: IAlert[]): Promise<IBuiltAlert[]> {
           payload: {
             tipo: tipo,
             idNotificacion: alert.alertId,
-            fechaHora: isCese
-              ? formatDateString(alert.resolvedAt!)
-              : formatDateString(alert.startedAt),
+            fechaHora: isCese ? formatDateString(alert.resolvedAt!) : formatDateString(alert.startedAt),
             nombreEquipo: alert.scope.devices[0].name,
             ipEquipo: alert.scope.devices[0].mac,
             causaEvento: rule.categoryType,
             evento: rule.title,
-            severidadEvento: isCese
-              ? AlertSeverityHelixEnum.CESE
-              : (rule.severityHelix as AlertSeverityHelixEnum),
-            descripcionEvento: `${rule.elementType} - ${rule.categoryType} - ${alert.comment}`,
+            severidadEvento: isCese ? AlertSeverityHelixEnum.CESE : (rule.severityHelix as AlertSeverityHelixEnum),
+            descripcionEvento: armarDescripcion(rule.elementType, rule.categoryType, alert.comment),
             nombreCliente: alert.organization.name,
             ubicacion: alert.location,
             fase: fase,
@@ -436,10 +426,7 @@ async function buildAlertsForHelix(alerts: IAlert[]): Promise<IBuiltAlert[]> {
       }
     } catch (error) {
       alertNotSentCount = alertNotSentCount + 1;
-      console.error(
-        `Error al validar la alerta ${alert.alertId} para envío manual, no se enviará a Helix`,
-        error
-      );
+      console.error(`Error al validar la alerta ${alert.alertId} para envío manual, no se enviará a Helix`, error);
     }
   }
   if (skippedNotInCatalog > 0) {
@@ -465,43 +452,32 @@ function formatDateString(dateString: string): string {
 
 export const getAndSetResolvedAlerts = async () => {
   try {
-    console.log("SRA: Obteniendo alertas resueltas para procesar su actualización: ", new Date(Date.now()).toLocaleString('es-CO'));
+    console.log(
+      "SRA: Obteniendo alertas resueltas para procesar su actualización: ",
+      new Date(Date.now()).toLocaleString("es-CO")
+    );
     const resolvedAlerts: IAlertCisco[] = await getListOfResolvedAlerts();
     const activeAlerts: IAlert[] = await getAlertsInGlpi();
-    console.log("resolvedAlerts[0]: ", resolvedAlerts[0])
-    const activeAlertsMap = new Map(
-      activeAlerts.map((alert) => [alert.alertId, alert])
-    );
+    console.log("resolvedAlerts[0]: ", resolvedAlerts[0]);
+    const activeAlertsMap = new Map(activeAlerts.map((alert) => [alert.alertId, alert]));
 
-    const alertsToUpdate: { alertId: string; resolvedAt: string }[] =
-      resolvedAlerts
-        .filter(
-          (resolved) => activeAlertsMap.has(resolved.id) && resolved.resolvedAt
-        )
-        .map((resolved) => {
-          return {
-            alertId: resolved.id,
-            resolvedAt: resolved.resolvedAt!,
-          };
-        });
+    const alertsToUpdate: { alertId: string; resolvedAt: string }[] = resolvedAlerts
+      .filter((resolved) => activeAlertsMap.has(resolved.id) && resolved.resolvedAt)
+      .map((resolved) => {
+        return {
+          alertId: resolved.id,
+          resolvedAt: resolved.resolvedAt!,
+        };
+      });
 
-    const updatedPromises = alertsToUpdate.map(
-      async (alertToUpdate: { alertId: string; resolvedAt: string }) => {
-        try {
-          console.log("updatedPromises: ", alertToUpdate.alertId);
-          await updateAlertResolved(
-            alertToUpdate.alertId,
-            alertToUpdate.resolvedAt
-          );
-        } catch (error) {
-          console.error(
-            `Error al actualizar la alerta ${alertToUpdate.alertId}`,
-            error
-          );
-        }
+    const updatedPromises = alertsToUpdate.map(async (alertToUpdate: { alertId: string; resolvedAt: string }) => {
+      try {
+        console.log("updatedPromises: ", alertToUpdate.alertId);
+        await updateAlertResolved(alertToUpdate.alertId, alertToUpdate.resolvedAt);
+      } catch (error) {
+        console.error(`Error al actualizar la alerta ${alertToUpdate.alertId}`, error);
       }
-    );
-
+    });
 
     await Promise.allSettled(updatedPromises);
     console.log(`SRA: Se resolvieron: ${alertsToUpdate.length} alertas`);
