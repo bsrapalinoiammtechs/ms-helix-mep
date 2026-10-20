@@ -34,6 +34,8 @@ Uso:
   python3 reponer_ceses_y_alarmas.py ceses [--lote 300] [--aplicar]
   python3 reponer_ceses_y_alarmas.py estado
   python3 reponer_ceses_y_alarmas.py alarmas [--aplicar]
+`plan` también avisa de COLISIONES: alarmas de otros puentes (AyA, ACS2...) con el mismo
+nombre de equipo que uno de los ceses; `ceses` se niega a correr si las hay (--ignorar-colisiones).
 No cubre las alarmas HUÉRFANAS (sin alerta en -wh ni en mep3): se listan en `plan`
 para verificarlas contra Meraki antes de tocarlas.
 """
@@ -76,6 +78,17 @@ def armar_plan(tcp_activos, wh_por_id, abiertas_wh):
         elif equipo(a) in equipos_con_cese:
             alarmas[aid] = {"alertId": aid, "eq": equipo(a), "type": a.get("type"), "motivo": "equipo_con_cese"}
     return {"ceses": sorted(ceses, key=lambda c: str(c["resolvedAt"])), "alarmas": list(alarmas.values())}
+
+
+def colisiones(tcp_activos, wh_por_id, equipos_con_cese):
+    """Función pura. Alarmas activas en el TCP que NO son de -wh (otros puentes u organizaciones)
+    pero cuyo NOMBRE DE EQUIPO coincide con uno que va a recibir un cese: Helix identifica por
+    nombre, así que ese cese cerraría también esas alarmas ajenas."""
+    return [
+        {"alertId": t["alertId"], "eq": t.get("nombreEquipo"), "cliente": t.get("nombreCliente")}
+        for t in tcp_activos
+        if not t["alertId"].startswith("MW-") and t["alertId"] not in wh_por_id and t.get("nombreEquipo") in equipos_con_cese
+    ]
 
 
 def entorno_ok():
@@ -131,6 +144,7 @@ def cmd_plan():
     wh = por_ids(WH, [t["alertId"] for t in activos])
     abiertas = consulta_app(WH, "{resolvedAt:null,isGlpi:true}")
     plan = armar_plan(activos, wh, abiertas)
+    plan["colisiones"] = colisiones(activos, wh, {c["eq"] for c in plan["ceses"] if c["eq"]})
     json.dump(plan, open(PLAN, "w"))
     huerfanas = [t for t in activos if t["alertId"] not in wh]
     print(f"alarmas activas en el TCP (sin guardián): {len(activos)}")
@@ -140,7 +154,11 @@ def cmd_plan():
     print(f"  ALARMAS a reenviar (después de los ceses): {len(plan['alarmas'])}")
     print("    por motivo:", dict(Counter(a['motivo'] for a in plan['alarmas'])))
     print("    por tipo:", dict(Counter(a['type'] for a in plan['alarmas'])))
-    print(f"  HUÉRFANAS (sin alerta en -wh; NO se tocan, verificar contra Meraki): {len(huerfanas)}")
+    print(f"  COLISIONES (alarmas de OTROS puentes con el mismo nombre de equipo que un cese del plan): {len(plan['colisiones'])}")
+    for c in plan["colisiones"][:15]:
+        print(f"    {c['eq']} | {c['cliente']} | {c['alertId']}")
+    print(f"  HUÉRFANAS (sin alerta en -wh: alarmas de otros puentes/organizaciones o muy antiguas; NO se tocan): {len(huerfanas)}")
+    print("    por cliente:", dict(Counter(t.get('nombreCliente') for t in huerfanas)))
     for t in huerfanas[:15]:
         print(f"    {t.get('nombreEquipo')} | {t.get('evento','')[:35]} | {t.get('nombreCliente')} | {str(t.get('createdAt'))[:30]}")
     print(f"\nplan guardado en {PLAN}")
@@ -149,6 +167,9 @@ def cmd_plan():
 def cmd_ceses():
     plan = cargar_plan()
     entorno_ok()
+    if plan.get("colisiones") and "--ignorar-colisiones" not in sys.argv:
+        abortar(f"el plan tiene {len(plan['colisiones'])} colisiones (alarmas ajenas con el mismo nombre de equipo): "
+                "revísalas con `plan`; usa --ignorar-colisiones solo si sabes que son las mismas")
     hechos = set(leer_json(CESES_APLICADOS, []))
     pendientes = [c for c in plan["ceses"] if c["alertId"] not in hechos]
     lote = pendientes[:LOTE]
