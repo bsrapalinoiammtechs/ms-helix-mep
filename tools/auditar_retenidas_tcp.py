@@ -17,6 +17,10 @@ Clasifica cada alarma activa del TCP (se ignoran las del guardián, `MW-*`):
   cerrada_mep3      solo en mep3 y cerrada -> CESE NO ENTREGADO (era de mep3)
   huerfana          no existe en ninguna de las dos bases (anterior a lo copiado)
 
+Además, en el modo global se hace la comparación INVERSA: alertas ABIERTAS de GLPI
+en -wh cuya alarma NO está activa en el TCP (alarma silenciada o nunca enviada,
+p. ej. por reglas de silencio): se agrupan por tipo.
+
 Con --equipos archivo.txt muestra el estado de ESOS equipos en las tres bases,
 tengan o no alarma activa en el TCP. Cada línea: `equipo;dd/mm/aaaa hh:mm:ss`
 (la segunda parte es "Fecha y Hora Alarma" de Helix, hora de Costa Rica; es
@@ -162,6 +166,11 @@ def diagnosticar(nombre, alarma_utc, wh_docs, m3_docs, tcp_por_id):
     return r
 
 
+def alarmas_no_activas(abiertas_wh, tcp_activos_ids):
+    """Función pura: alertas abiertas de GLPI en -wh cuya alarma no está activa en el TCP."""
+    return [a for a in abiertas_wh if a["alertId"] not in tcp_activos_ids]
+
+
 def main_global():
     ahora = datetime.datetime.now(datetime.timezone.utc)
     activos = consulta_tcp("{isActive:true}")
@@ -180,6 +189,15 @@ def main_global():
         print(f"  [{r['cat']}] {r['eq']} | {t.get('evento','')[:40]} | edad={edad_dias(t, ahora)}d | -wh: {resumen_app(r['wh'])} | mep3: {resumen_app(r['m3'])}")
     if len(retenidas) > MAX_LINEAS:
         print(f"  ... y {len(retenidas) - MAX_LINEAS} más")
+    # Comparación inversa: abiertas de GLPI en -wh que el TCP NO tiene como alarma activa.
+    abiertas = consulta_app(WH, "{resolvedAt:null,isGlpi:true}")
+    activos_ids = {t["alertId"] for t in activos}
+    sin_alarma = alarmas_no_activas(abiertas, activos_ids)
+    print(f"\nabiertas de GLPI en -wh: {len(abiertas)} | sin alarma activa en el TCP (silenciadas o nunca enviadas): {len(sin_alarma)}")
+    print("  por tipo:", dict(Counter(a.get("type") for a in sin_alarma)))
+    print("  de ellas marcadas como enviadas en -wh (isTcp:true):", sum(1 for a in sin_alarma if a.get("isTcp")))
+    for a in sorted(sin_alarma, key=lambda x: str(x.get("startedAt")))[:25]:
+        print(f"    {equipo(a)} {a.get('type')} ini={str(a.get('startedAt'))[:19]} isTcp={a.get('isTcp')}")
     vig = [r for r in res if r["cat"] in ("vigente_wh", "vigente_mep3")]
     viejas = sorted(vig, key=lambda x: str(x["tcp"].get("createdAt")))[:30]
     print(f"\nVIGENTES (abiertas en las apps): {len(vig)}. Las 30 más antiguas, con su última verificación contra Meraki:")
@@ -201,7 +219,7 @@ def main_equipos(ruta):
     print("diagnóstico:", dict(Counter(d["cat"] for d in diag)))
     gaps = sorted(d["gap_s"] for d in diag if d["gap_s"] is not None and d["cat"] == "cese_en_tcp_no_aplicado")
     if gaps:
-        print(f"segundos entre alarma y cese en el TCP (casos cese_en_tcp_no_aplicado): min={gaps[0]} mediana={gaps[len(gaps)//2]} max={gaps[-1]}")
+        print(f"segundos entre la creación y la última actualización del documento en el TCP (casos cese_en_tcp_no_aplicado): min={gaps[0]} mediana={gaps[len(gaps)//2]} max={gaps[-1]}")
     durs = sorted(d["dur_min"] for d in diag if d["dur_min"] is not None)
     if durs:
         print(f"duración de la alerta (inicio -> cierre, min): min={durs[0]} mediana={durs[len(durs)//2]} max={durs[-1]}")
@@ -209,7 +227,7 @@ def main_equipos(ruta):
     for d in sorted(diag, key=lambda x: x["cat"]):
         t = d["tcp"] or {}
         w, m = d["wh"], d["m3"]
-        print(f"[{d['cat']}] {d['eq']} alerta={d['alertId']} en={d['en']} dur={d['dur_min']}min gap_alarma_cese={d['gap_s']}s "
+        print(f"[{d['cat']}] {d['eq']} alerta={d['alertId']} en={d['en']} dur={d['dur_min']}min tcp_marcado_enviado_tras={d['gap_s']}s "
               f"| tcp activa={t.get('isActive')} | -wh: {resumen_app(w)} | mep3: {resumen_app(m)}")
 
 
