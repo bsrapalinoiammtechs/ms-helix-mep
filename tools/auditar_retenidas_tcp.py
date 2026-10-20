@@ -35,6 +35,7 @@ diagnostica cada caso:
 
 Uso (en el servidor):
   python3 auditar_retenidas_tcp.py
+  python3 auditar_retenidas_tcp.py --instancia mongodb-helix-acs2,ms_helix_acs2,ms-helix-acs2 --cliente ACS2
   python3 auditar_retenidas_tcp.py --equipos /tmp/equipos_cliente.txt
 """
 import datetime
@@ -46,6 +47,11 @@ from migrar_estado_a_wh import M3, WH, mongo, ultima_salida
 
 TCP = ("mongodb-tcp", "ms_helix_tcp", "ms-helix-tcp")
 ARCHIVO_EQUIPOS = sys.argv[sys.argv.index("--equipos") + 1] if "--equipos" in sys.argv else None
+# Otra organización (p. ej. ACS2, que sigue con la versión por polling): --instancia contenedor_mongo,base,contenedor_app
+# sustituye a -wh como "dueña" de las alertas, y --cliente texto limita las alarmas del TCP a ese cliente.
+if "--instancia" in sys.argv:
+    WH = tuple(sys.argv[sys.argv.index("--instancia") + 1].split(","))
+CLIENTE = sys.argv[sys.argv.index("--cliente") + 1] if "--cliente" in sys.argv else None
 MAX_LINEAS = 120
 CR = datetime.timezone(datetime.timedelta(hours=-6))
 
@@ -174,6 +180,8 @@ def alarmas_no_activas(abiertas_wh, tcp_activos_ids):
 def main_global():
     ahora = datetime.datetime.now(datetime.timezone.utc)
     activos = consulta_tcp("{isActive:true}")
+    if CLIENTE:
+        activos = [t for t in activos if CLIENTE.lower() in str(t.get("nombreCliente", "")).lower()]
     ids = [t["alertId"] for t in activos if not t["alertId"].startswith("MW-")]
     wh = por_ids(WH, ids)
     m3 = por_ids(M3, [i for i in ids if i not in wh])
@@ -229,6 +237,15 @@ def main_equipos(ruta):
         w, m = d["wh"], d["m3"]
         print(f"[{d['cat']}] {d['eq']} alerta={d['alertId']} en={d['en']} dur={d['dur_min']}min tcp_marcado_enviado_tras={d['gap_s']}s "
               f"| tcp activa={t.get('isActive')} | -wh: {resumen_app(w)} | mep3: {resumen_app(m)}")
+        if d["cat"] == "sin_coincidencia":
+            # Sin hora de alarma (o sin alerta a esa hora): se muestra TODO lo que hay del equipo.
+            n = d["eq"]
+            for t2 in sorted((x for x in tcp if x.get("nombreEquipo") == n), key=lambda x: str(x.get("createdAt"))):
+                print(f"    TCP  {t2['alertId']} activa={t2.get('isActive')} sev={t2.get('severidadEvento')} cliente={t2.get('nombreCliente')} "
+                      f"creada={str(t2.get('createdAt'))[:40]} | {t2.get('evento','')[:40]}")
+            for etiqueta, docs in (("-wh ", wh), ("mep3", m3)):
+                for a in sorted((x for x in docs if equipo(x) == n), key=lambda x: str(x.get("startedAt")))[-6:]:
+                    print(f"    {etiqueta} {a['alertId']} {a.get('type')} ini={str(a.get('startedAt'))[:19]} {resumen_app(a)}")
 
 
 if __name__ == "__main__":
