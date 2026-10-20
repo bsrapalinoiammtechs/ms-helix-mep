@@ -149,7 +149,8 @@ def main():
         entorno_ok()
     elif not DIRECTO:
         abortar("con otra instancia usa --directo (solo -wh tiene el endpoint de consulta)")
-    pos = [a for a in sys.argv[1:] if a.isdigit()]
+    # alertId: solo números largos (los valores de --max/--espera son cortos y no deben confundirse con ids)
+    pos = [a for a in sys.argv[1:] if a.isdigit() and len(a) >= 15]
     if "--todas" in sys.argv:
         abiertas = consulta_app(INST, "{resolvedAt:null,isGlpi:true}")
     elif "--equipos" in sys.argv:
